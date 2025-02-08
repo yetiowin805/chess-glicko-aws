@@ -16,9 +16,13 @@ phases:
       - cd python
       - zip currentMonthFIDEGlicko.zip currentMonthFIDEGlicko.py
       - zip runGlicko.zip runGlicko.py
+      - cd ..
+      - echo "Packaging AWS SAM template..."
+      - sam package --template-file template.yaml --output-template-file packaged.yaml --s3-bucket fide-glicko-packages
 artifacts:
   files:
     - go/go-scraper.zip
     - python/currentMonthFIDEGlicko.zip
     - python/runGlicko.zip
     - asl/FideScraperFlow.json
+    - packaged.yaml
