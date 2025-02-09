@@ -5,6 +5,11 @@ phases:
     runtime-versions:
       golang: 1.21
       python: 3.10
+    commands:
+      - echo "Installing Go dependencies..."
+      - cd go
+      - go mod tidy
+      - cd ..
   build:
     commands:
       - echo "Building Go Lambda..."
