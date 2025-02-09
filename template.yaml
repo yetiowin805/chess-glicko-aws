@@ -53,6 +53,6 @@ Resources:
   FideScraperStateMachine:
     Type: AWS::Serverless::StateMachine
     Properties:
-      StateMachineName: FideScraperFlow
+      Name: FideScraperFlow
       DefinitionUri: asl/FideScraperFlow.json
       Role: arn:aws:iam::961341531973:role/service-role/StepFunctions-FideScraperFlow-role-vqvxm5vc0
