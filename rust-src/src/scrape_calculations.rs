@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client as S3Client;
+use aws_types::region::Region;
 use clap::Parser;
 use futures::{stream, StreamExt};
 use regex::Regex;
@@ -62,11 +63,11 @@ struct PlayerCalculationScraper {
 
 impl PlayerCalculationScraper {
     async fn new(s3_bucket: String, aws_region: String) -> Result<Self> {
-        // Initialize AWS SDK with older API
         let config = aws_config::from_env()
-            .region(Region::new(&args.aws_region))
+            .region(Region::new(aws_region.clone()))
             .load()
             .await;
+
         let s3_client = S3Client::new(&config);
 
         // Initialize HTTP client with conservative settings
