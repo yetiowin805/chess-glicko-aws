@@ -42,7 +42,7 @@ log "Step 1 completed successfully"
 
 # Step 2: Process Player Data
 log "Step 2: Processing player data..."
-python src/process_fide_rating_list.py \
+python src/process_player_data.py \
     --month "$PROCESS_MONTH" \
     --s3_bucket "$S3_BUCKET" \
     --aws_region "$AWS_REGION"
@@ -54,13 +54,26 @@ fi
 
 log "Step 2 completed successfully"
 
+# Step 3: Scrape Tournament Data
+log "Step 3: Scraping tournament data..."
+python src/fide_scraper.py \
+    --month "$PROCESS_MONTH" \
+    --s3_bucket "$S3_BUCKET" \
+    --aws_region "$AWS_REGION"
+
+if [ $? -ne 0 ]; then
+    log "ERROR: Tournament data scraping failed"
+    exit 1
+fi
+
+log "Step 3 completed successfully"
+
 # Future steps would go here:
-# Step 3: Download tournament data
 # Step 4: Download game data  
 # Step 5: Calculate ratings
 # Step 6: Upload results
 
-# For now, let's upload the completion marker to show both steps completed
+# Upload the completion marker to show all completed steps
 if [ -n "$S3_BUCKET" ]; then
     log "Uploading results to S3..."
     
@@ -71,10 +84,12 @@ Pipeline completed at $(date -u +%Y-%m-%dT%H:%M:%SZ) for month $PROCESS_MONTH
 Steps completed:
 1. Downloaded player data from FIDE
 2. Processed player data to JSON format
+3. Scraped tournament data for all countries
 
 Files created:
 - s3://$S3_BUCKET/persistent/player_info/raw/$PROCESS_MONTH.txt
 - s3://$S3_BUCKET/persistent/player_info/processed/$PROCESS_MONTH.txt
+- s3://$S3_BUCKET/persistent/tournament_data/raw/[country]/$PROCESS_MONTH/tournaments.txt (for each country)
 EOF
     
     aws s3 cp /tmp/completion.txt "s3://$S3_BUCKET/results/$PROCESS_MONTH/completion.txt"
@@ -86,7 +101,7 @@ log "Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
 if [ -n "$SNS_TOPIC_ARN" ]; then
     aws sns publish \
         --topic-arn "$SNS_TOPIC_ARN" \
-        --message "Chess Rating Pipeline completed successfully for $PROCESS_MONTH. Downloaded and processed player data." \
+        --message "Chess Rating Pipeline completed successfully for $PROCESS_MONTH. Downloaded player data, processed it, and scraped tournament data." \
         --subject "Chess Pipeline Success - $PROCESS_MONTH" \
         --region "$AWS_REGION" || log "Warning: Failed to send SNS notification"
 fi
