@@ -70,8 +70,8 @@ struct PlayerCalculationScraper {
 
 impl PlayerCalculationScraper {
     async fn new(s3_bucket: String, aws_region: String) -> Result<Self> {
-        // Initialize AWS SDK
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        // Initialize AWS SDK - older version without behavior-version-latest
+        let config = aws_config::from_env()
             .region(aws_config::Region::new(aws_region))
             .load()
             .await;

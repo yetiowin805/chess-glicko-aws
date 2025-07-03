@@ -70,7 +70,7 @@ log "Step 3 completed successfully"
 
 # Step 4: Aggregate Player IDs
 log "Step 4: Aggregating player IDs by time control..."
-python src/player_aggregator.py \
+python src/aggregate_player_ids.py \
     --month "$PROCESS_MONTH" \
     --s3_bucket "$S3_BUCKET" \
     --aws_region "$AWS_REGION"
