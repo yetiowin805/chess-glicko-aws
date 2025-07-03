@@ -68,10 +68,24 @@ fi
 
 log "Step 3 completed successfully"
 
+# Step 4: Aggregate Player IDs
+log "Step 4: Aggregating player IDs by time control..."
+python src/aggregate_player_ids.py \
+    --month "$PROCESS_MONTH" \
+    --s3_bucket "$S3_BUCKET" \
+    --aws_region "$AWS_REGION"
+
+if [ $? -ne 0 ]; then
+    log "ERROR: Player ID aggregation failed"
+    exit 1
+fi
+
+log "Step 4 completed successfully"
+
 # Future steps would go here:
-# Step 4: Download game data  
-# Step 5: Calculate ratings
-# Step 6: Upload results
+# Step 5: Download game data  
+# Step 6: Calculate ratings
+# Step 7: Upload results
 
 # Upload the completion marker to show all completed steps
 if [ -n "$S3_BUCKET" ]; then
@@ -85,15 +99,18 @@ Steps completed:
 1. Downloaded player data from FIDE
 2. Processed player data to JSON format
 3. Scraped tournament IDs and processed tournament data in parallel
+4. Aggregated unique player IDs by time control
 
 Files created:
 - s3://$S3_BUCKET/persistent/player_info/raw/$PROCESS_MONTH.txt
 - s3://$S3_BUCKET/persistent/player_info/processed/$PROCESS_MONTH.txt
 - s3://$S3_BUCKET/persistent/tournament_data/processed/[time_control]/$PROCESS_MONTH/[tournament_id].txt
+- s3://$S3_BUCKET/persistent/active_players/$PROCESS_MONTH_[time_control].txt
 
 Data structure:
 - Tournament data is organized by time control (standard/rapid/blitz)
 - Each tournament file contains JSON lines with player ID and name
+- Active player lists contain unique player IDs per time control for the month
 - Player data is processed and ready for rating calculations
 - No intermediate tournament ID files stored (processed directly)
 EOF
@@ -107,7 +124,7 @@ log "Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
 if [ -n "$SNS_TOPIC_ARN" ]; then
     aws sns publish \
         --topic-arn "$SNS_TOPIC_ARN" \
-        --message "Chess Rating Pipeline completed successfully for $PROCESS_MONTH. Downloaded player data, processed it, and scraped/processed tournament data in parallel." \
+        --message "Chess Rating Pipeline completed successfully for $PROCESS_MONTH. Downloaded player data, processed it, scraped/processed tournament data in parallel, and aggregated unique player IDs by time control." \
         --subject "Chess Pipeline Success - $PROCESS_MONTH" \
         --region "$AWS_REGION" || log "Warning: Failed to send SNS notification"
 fi
