@@ -52,6 +52,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "chess_data" {
     id     = "intelligent-tiering"
     status = "Enabled"
 
+    filter {}
+
     transition {
       days          = 0
       storage_class = "INTELLIGENT_TIERING"
