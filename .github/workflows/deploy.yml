@@ -65,7 +65,47 @@ jobs:
 
     - name: Terraform Apply
       working-directory: ./terraform
-      run: terraform apply -auto-approve tfplan
+      run: |
+        # Try to import existing resources before applying
+        echo "Checking for existing resources to import..."
+        
+        # Import ECR repository if it exists
+        if aws ecr describe-repositories --repository-names chess-glicko-pipeline --region ${{ env.AWS_REGION }} 2>/dev/null; then
+          echo "ECR repository exists, importing..."
+          terraform import aws_ecr_repository.chess_pipeline chess-glicko-pipeline || true
+        fi
+        
+        # Import CloudWatch log group if it exists
+        if aws logs describe-log-groups --log-group-name-prefix /ecs/chess-glicko --region ${{ env.AWS_REGION }} --query 'logGroups[0]' --output text 2>/dev/null | grep -q "/ecs/chess-glicko"; then
+          echo "CloudWatch log group exists, importing..."
+          terraform import aws_cloudwatch_log_group.chess_pipeline /ecs/chess-glicko || true
+        fi
+        
+        # Import IAM roles if they exist
+        if aws iam get-role --role-name chess-glicko-ecs-execution-role 2>/dev/null; then
+          echo "ECS execution role exists, importing..."
+          terraform import aws_iam_role.ecs_execution_role chess-glicko-ecs-execution-role || true
+        fi
+        
+        if aws iam get-role --role-name chess-glicko-ecs-task-role 2>/dev/null; then
+          echo "ECS task role exists, importing..."
+          terraform import aws_iam_role.ecs_task_role chess-glicko-ecs-task-role || true
+        fi
+        
+        if aws iam get-role --role-name chess-glicko-eventbridge-role 2>/dev/null; then
+          echo "EventBridge role exists, importing..."
+          terraform import aws_iam_role.eventbridge_role chess-glicko-eventbridge-role || true
+        fi
+        
+        # Import security group if it exists
+        SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=chess-glicko-ecs-tasks" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)
+        if [ "$SG_ID" != "None" ] && [ -n "$SG_ID" ]; then
+          echo "Security group exists, importing..."
+          terraform import aws_security_group.ecs_tasks $SG_ID || true
+        fi
+        
+        # Now apply the configuration
+        terraform apply -auto-approve tfplan
 
     - name: Get Terraform Outputs
       id: terraform
