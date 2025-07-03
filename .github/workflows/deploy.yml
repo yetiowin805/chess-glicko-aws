@@ -55,6 +55,18 @@ jobs:
       working-directory: ./terraform
       run: |
         echo "Checking for existing resources to import..."
+
+        # Get AWS Account ID for consistent bucket naming
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        S3_BUCKET_NAME="${{ env.PROJECT_NAME }}-data-$ACCOUNT_ID"
+        
+        # Import S3 bucket if it exists
+        if aws s3api head-bucket --bucket "$S3_BUCKET_NAME" 2>/dev/null; then
+          echo "S3 bucket exists, importing..."
+          terraform import aws_s3_bucket.chess_data "$S3_BUCKET_NAME" || true
+        else
+          echo "S3 bucket does not exist, will be created"
+        fi
         
         # Import ECR repository if it exists
         if aws ecr describe-repositories --repository-names chess-glicko-pipeline --region ${{ env.AWS_REGION }} 2>/dev/null; then

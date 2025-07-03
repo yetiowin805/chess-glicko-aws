@@ -29,7 +29,11 @@ data "aws_subnets" "default" {
 
 # S3 Bucket for data storage
 resource "aws_s3_bucket" "chess_data" {
-  bucket = "${var.project_name}-data"
+  bucket = "${var.project_name}-data-${data.aws_caller_identity.current.account_id}"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_s3_bucket_versioning" "chess_data" {
