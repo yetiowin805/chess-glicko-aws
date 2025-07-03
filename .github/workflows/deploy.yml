@@ -75,7 +75,19 @@ jobs:
         echo "ecs_cluster_name=$(terraform output -raw ecs_cluster_name)" >> $GITHUB_OUTPUT
         echo "task_definition_arn=$(terraform output -raw task_definition_arn)" >> $GITHUB_OUTPUT
         echo "s3_bucket_name=$(terraform output -raw s3_bucket_name)" >> $GITHUB_OUTPUT
-
+  name: Get Terraform Outputs
+  id: terraform
+  working-directory: ./terraform
+  run: |
+    echo "=== Debugging Terraform Outputs ==="
+    terraform output
+    echo "=== Raw ECR Repository URL ==="
+    terraform output -raw ecr_repository_url || echo "ERROR: ecr_repository_url output not found"
+    echo "=== Setting GitHub Outputs ==="
+    echo "ecr_repository_url=$(terraform output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
+    echo "ecs_cluster_name=$(terraform output -raw ecs_cluster_name)" >> $GITHUB_OUTPUT
+    echo "task_definition_arn=$(terraform output -raw task_definition_arn)" >> $GITHUB_OUTPUT
+    echo "s3_bucket_name=$(terraform output -raw s3_bucket_name)" >> $GITHUB_OUTPUT
   build-and-deploy:
     needs: deploy-infrastructure
     runs-on: ubuntu-latest
