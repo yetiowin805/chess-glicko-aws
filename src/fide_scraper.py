@@ -290,7 +290,11 @@ class FIDETournamentScraper:
         """Async wrapper for checking S3 file existence"""
         loop = asyncio.get_event_loop()
         try:
-            await loop.run_in_executor(None, self.s3_client.head_object, self.s3_bucket, s3_key)
+            # Fix: Use a lambda to pass keyword arguments correctly
+            await loop.run_in_executor(
+                None, 
+                lambda: self.s3_client.head_object(Bucket=self.s3_bucket, Key=s3_key)
+            )
             return True
         except ClientError:
             return False
@@ -299,7 +303,10 @@ class FIDETournamentScraper:
         """Async wrapper for S3 upload"""
         loop = asyncio.get_event_loop()
         try:
-            await loop.run_in_executor(None, self.s3_client.upload_file, local_path, self.s3_bucket, s3_key)
+            await loop.run_in_executor(
+                None, 
+                lambda: self.s3_client.upload_file(local_path, self.s3_bucket, s3_key)
+            )
             logger.debug(f"Uploaded {local_path} to S3 as {s3_key}")
         except ClientError as e:
             logger.error(f"Failed to upload {local_path} to S3: {str(e)}")
