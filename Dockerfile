@@ -1,5 +1,5 @@
 # Multi-stage build: Rust builder stage
-FROM rust:1.81-slim AS rust-builder
+FROM rust:1.88-slim AS rust-builder
 
 # Install system dependencies for Rust build
 RUN apt-get update && apt-get install -y \
