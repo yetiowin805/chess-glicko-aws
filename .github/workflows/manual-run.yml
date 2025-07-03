@@ -1,0 +1,106 @@
+name: Manual Glicko Pipeline Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      month:
+        description: 'Month to process (YYYY-MM format)'
+        required: true
+        default: '2024-01'
+      task_cpu:
+        description: 'CPU units (1024 = 1 vCPU)'
+        required: false
+        default: '1024'
+      task_memory:
+        description: 'Memory in MiB'
+        required: false
+        default: '2048'
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  PROJECT_NAME: chess-glicko
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Validate Month Format
+      run: |
+        if [[ ! "${{ github.event.inputs.month }}" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
+          echo "Error: Month must be in YYYY-MM format"
+          exit 1
+        fi
+
+    - name: Get Infrastructure Details
+      id: infra
+      run: |
+        # Get cluster name
+        CLUSTER_NAME=$(aws ecs list-clusters \
+          --query "clusterArns[?contains(@, '${{ env.PROJECT_NAME }}')]" \
+          --output text | cut -d'/' -f2)
+        echo "cluster_name=$CLUSTER_NAME" >> $GITHUB_OUTPUT
+        
+        # Get task definition
+        TASK_DEF=$(aws ecs list-task-definitions \
+          --family-prefix ${{ env.PROJECT_NAME }} \
+          --sort DESC \
+          --max-items 1 \
+          --query 'taskDefinitionArns[0]' \
+          --output text | cut -d'/' -f2 | cut -d':' -f1)
+        echo "task_definition=$TASK_DEF" >> $GITHUB_OUTPUT
+        
+        # Get default subnet
+        SUBNET_ID=$(aws ec2 describe-subnets \
+          --filters "Name=default-for-az,Values=true" \
+          --query 'Subnets[0].SubnetId' \
+          --output text)
+        echo "subnet_id=$SUBNET_ID" >> $GITHUB_OUTPUT
+
+    - name: Run Pipeline Task
+      env:
+        CLUSTER_NAME: ${{ steps.infra.outputs.cluster_name }}
+        TASK_DEFINITION: ${{ steps.infra.outputs.task_definition }}
+        SUBNET_ID: ${{ steps.infra.outputs.subnet_id }}
+      run: |
+        echo "Running pipeline for month: ${{ github.event.inputs.month }}"
+        echo "Using cluster: $CLUSTER_NAME"
+        echo "Using task definition: $TASK_DEFINITION"
+        
+        TASK_ARN=$(aws ecs run-task \
+          --cluster $CLUSTER_NAME \
+          --task-definition $TASK_DEFINITION \
+          --launch-type FARGATE \
+          --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_ID],assignPublicIp=ENABLED}" \
+          --overrides "{
+            \"taskRoleArn\": \"$(aws ecs describe-task-definition --task-definition $TASK_DEFINITION --query 'taskDefinition.taskRoleArn' --output text)\",
+            \"cpu\": \"${{ github.event.inputs.task_cpu }}\",
+            \"memory\": \"${{ github.event.inputs.task_memory }}\",
+            \"containerOverrides\": [{
+              \"name\": \"chess-glicko\",
+              \"environment\": [{
+                \"name\": \"PROCESS_MONTH\",
+                \"value\": \"${{ github.event.inputs.month }}\"
+              }]
+            }]
+          }" \
+          --query 'tasks[0].taskArn' \
+          --output text)
+        
+        echo "✅ Pipeline task started successfully!"
+        echo "Task ARN: $TASK_ARN"
+        echo ""
+        echo "📊 Monitor progress:"
+        echo "  - Task status: aws ecs describe-tasks --cluster $CLUSTER_NAME --tasks $TASK_ARN"
+        echo "  - Logs: aws logs tail /ecs/${{ env.PROJECT_NAME }} --follow"
+        echo ""
+        echo "🔗 AWS Console Links:"
+        echo "  - ECS Task: https://console.aws.amazon.com/ecs/home?region=${{ env.AWS_REGION }}#/clusters/$CLUSTER_NAME/tasks"
+        echo "  - CloudWatch Logs: https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/%2Fecs%2F${{ env.PROJECT_NAME }}"
