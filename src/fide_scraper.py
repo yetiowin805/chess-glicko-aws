@@ -126,8 +126,7 @@ class FIDETournamentScraper:
             headers = {
                 "Accept": "application/json, text/javascript, */*; q=0.01",
                 "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"https://ratings.fide.com/rated_tournaments.phtml?country={country}&period={year}-{month_str}-01",
-                "User-Agent": "FIDE Tournament Scraper 1.0"
+                "Referer": f"https://ratings.fide.com/rated_tournaments.phtml?country={country}&period={year}-{month_str}-01"
             }
             
             logger.info(f"Making request to FIDE for {country}: {api_url}?{requests.compat.urlencode(params)}")
