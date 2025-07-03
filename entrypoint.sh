@@ -42,7 +42,7 @@ log "Step 1 completed successfully"
 
 # Step 2: Process Player Data
 log "Step 2: Processing player data..."
-python src/process_player_data.py \
+python src/process_fide_rating_list.py \
     --month "$PROCESS_MONTH" \
     --s3_bucket "$S3_BUCKET" \
     --aws_region "$AWS_REGION"
