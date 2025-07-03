@@ -103,8 +103,10 @@ jobs:
           echo "Security group exists, importing..."
           terraform import aws_security_group.ecs_tasks $SG_ID || true
         fi
+
+        echo "Regenerating plan after imports..."
+        terraform plan -out=new-tfplan
         
-        # Now apply the configuration
         terraform apply -auto-approve tfplan
 
     - name: Get Terraform Outputs
