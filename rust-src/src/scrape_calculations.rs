@@ -64,7 +64,7 @@ impl PlayerCalculationScraper {
     async fn new(s3_bucket: String, aws_region: String) -> Result<Self> {
         // Initialize AWS SDK with older API
         let config = aws_config::from_env()
-            .region(aws_config::Region::new(aws_region))
+            .region(Region::new(&args.aws_region))
             .load()
             .await;
         let s3_client = S3Client::new(&config);
