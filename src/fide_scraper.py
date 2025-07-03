@@ -135,7 +135,7 @@ class FIDETournamentScraper:
             response = requests.get(api_url, params=params, headers=headers, timeout=30)
             
             logger.info(f"Response for {country}: Status {response.status_code}, Content-Type: {response.headers.get('content-type', 'unknown')}")
-            logger.debug(f"Response content preview for {country}: {response.text[:200]}...")
+            logger.info(f"Response content preview for {country}: {response.text[:200]}...")
             
             response.raise_for_status()
             
