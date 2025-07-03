@@ -10,17 +10,16 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /rust-build
 
-# Copy Cargo files first for better caching
+# Copy Cargo.toml first for better caching
 COPY rust-src/Cargo.toml ./Cargo.toml
-COPY rust-src/Cargo.lock ./Cargo.lock 2>/dev/null || true
 
 # Create dummy main to cache dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 
-# Build dependencies (this layer will be cached)
-RUN cargo build --release && rm -rf src
+# Build dependencies first (this layer will be cached)
+RUN cargo build --release && rm -rf src target/release/deps/calculation*
 
-# Copy actual source code
+# Now copy actual source code
 COPY rust-src/src ./src
 
 # Build the actual application
