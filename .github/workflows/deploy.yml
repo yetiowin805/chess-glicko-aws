@@ -24,10 +24,10 @@ jobs:
   deploy-infrastructure:
     runs-on: ubuntu-latest
     outputs:
-      ecr_repository: ${{ steps.terraform.outputs.ecr_repository_url }}
-      ecs_cluster: ${{ steps.terraform.outputs.ecs_cluster_name }}
-      task_definition: ${{ steps.terraform.outputs.task_definition_arn }}
-      s3_bucket: ${{ steps.terraform.outputs.s3_bucket_name }}
+      ecr_repository_url: ${{ steps.terraform.outputs.ecr_repository_url }}
+      ecs_cluster_name: ${{ steps.terraform.outputs.ecs_cluster_name }}
+      task_definition_arn: ${{ steps.terraform.outputs.task_definition_arn }}
+      s3_bucket_name: ${{ steps.terraform.outputs.s3_bucket_name }}
     
     steps:
     - name: Checkout
@@ -143,7 +143,7 @@ jobs:
     - name: Build, tag, and push image to Amazon ECR
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        ECR_REPOSITORY: ${{ needs.deploy-infrastructure.outputs.ecr_repository }}
+        ECR_REPOSITORY: ${{ needs.deploy-infrastructure.outputs.ecr_repository_url }}
         IMAGE_TAG: ${{ github.sha }}
       run: |
         # Extract repository name from full URL
@@ -159,8 +159,8 @@ jobs:
 
     - name: Update ECS Task Definition
       env:
-        CLUSTER_NAME: ${{ needs.deploy-infrastructure.outputs.ecs_cluster }}
-        ECR_REPOSITORY: ${{ needs.deploy-infrastructure.outputs.ecr_repository }}
+        CLUSTER_NAME: ${{ needs.deploy-infrastructure.outputs.ecs_cluster_name }}
+        ECR_REPOSITORY: ${{ needs.deploy-infrastructure.outputs.ecr_repository_url }}
       run: |
         # Get current task definition
         TASK_FAMILY=$(echo ${{ needs.deploy-infrastructure.outputs.task_definition }} | cut -d'/' -f2 | cut -d':' -f1)
@@ -198,8 +198,8 @@ jobs:
 
     - name: Run Test Pipeline
       env:
-        CLUSTER_NAME: ${{ needs.deploy-infrastructure.outputs.ecs_cluster }}
-        TASK_DEFINITION: ${{ needs.deploy-infrastructure.outputs.task_definition }}
+        CLUSTER_NAME: ${{ needs.deploy-infrastructure.outputs.ecs_cluster_name }}
+        TASK_DEFINITION: ${{ needs.deploy-infrastructure.outputs.task_definition_arn }}
       run: |
         # Get task definition family name
         TASK_FAMILY=$(echo $TASK_DEFINITION | cut -d'/' -f2 | cut -d':' -f1)
