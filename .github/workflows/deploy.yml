@@ -50,23 +50,9 @@ jobs:
       working-directory: ./terraform
       run: terraform init
 
-    - name: Create Terraform Variables
+    - name: Import Existing Resources
       working-directory: ./terraform
       run: |
-        cat > terraform.tfvars <<EOF
-        aws_region = "${{ env.AWS_REGION }}"
-        project_name = "${{ env.PROJECT_NAME }}"
-        notification_email = "${{ secrets.NOTIFICATION_EMAIL }}"
-        EOF
-
-    - name: Terraform Plan
-      working-directory: ./terraform
-      run: terraform plan -out=tfplan
-
-    - name: Terraform Apply
-      working-directory: ./terraform
-      run: |
-        # Try to import existing resources before applying
         echo "Checking for existing resources to import..."
         
         # Import ECR repository if it exists
@@ -104,10 +90,22 @@ jobs:
           terraform import aws_security_group.ecs_tasks $SG_ID || true
         fi
 
-        echo "Regenerating plan after imports..."
-        terraform plan -out=new-tfplan
-        
-        terraform apply -auto-approve new-tfplan
+    - name: Create Terraform Variables
+      working-directory: ./terraform
+      run: |
+        cat > terraform.tfvars <<EOF
+        aws_region = "${{ env.AWS_REGION }}"
+        project_name = "${{ env.PROJECT_NAME }}"
+        notification_email = "${{ secrets.NOTIFICATION_EMAIL }}"
+        EOF
+
+    - name: Terraform Plan
+      working-directory: ./terraform
+      run: terraform plan -out=tfplan
+
+    - name: Terraform Apply
+      working-directory: ./terraform
+      run: terraform apply -auto-approve tfplan
 
     - name: Get Terraform Outputs
       id: terraform
