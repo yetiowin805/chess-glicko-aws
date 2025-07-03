@@ -70,7 +70,7 @@ log "Step 3 completed successfully"
 
 # Step 4: Aggregate Player IDs
 log "Step 4: Aggregating player IDs by time control..."
-python src/aggregate_player_ids.py \
+python src/player_aggregator.py \
     --month "$PROCESS_MONTH" \
     --s3_bucket "$S3_BUCKET" \
     --aws_region "$AWS_REGION"
@@ -82,12 +82,12 @@ fi
 
 log "Step 4 completed successfully"
 
-# Step 5: Scrape Player Calculations
-log "Step 5: Scraping player calculation data..."
-python src/scrape_calculations.py \
+# Step 5: Scrape Player Calculations (Rust)
+log "Step 5: Scraping player calculation data with Rust..."
+calculation-scraper \
     --month "$PROCESS_MONTH" \
-    --s3_bucket "$S3_BUCKET" \
-    --aws_region "$AWS_REGION"
+    --s3-bucket "$S3_BUCKET" \
+    --aws-region "$AWS_REGION"
 
 if [ $? -ne 0 ]; then
     log "ERROR: Player calculation scraping failed"
