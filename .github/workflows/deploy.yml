@@ -107,7 +107,7 @@ jobs:
         echo "Regenerating plan after imports..."
         terraform plan -out=new-tfplan
         
-        terraform apply -auto-approve tfplan
+        terraform apply -auto-approve new-tfplan
 
     - name: Get Terraform Outputs
       id: terraform
