@@ -25,7 +25,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       ecr_repository_name: ${{ steps.terraform-outputs.outputs.ecr_repository_name }}
-      ecr_registry: ${{ steps.terraform-outputs.outputs.ecr_registry }}
       ecs_cluster_name: ${{ steps.terraform-outputs.outputs.ecs_cluster_name }}
       task_definition_family: ${{ steps.terraform-outputs.outputs.task_definition_family }}
       s3_bucket_name: ${{ steps.terraform-outputs.outputs.s3_bucket_name }}
@@ -143,15 +142,12 @@ jobs:
         # Extract components that don't contain secrets
         if [ -n "$ECR_URL" ]; then
           # Extract registry and repository name separately
-          ECR_REGISTRY=$(echo "$ECR_URL" | cut -d'/' -f1)
           ECR_REPO_NAME=$(echo "$ECR_URL" | cut -d'/' -f2)
           
-          echo "ECR_REGISTRY: '$ECR_REGISTRY'"
           echo "ECR_REPO_NAME: '$ECR_REPO_NAME'"
           
           # Set sanitized outputs (repository name doesn't contain account ID)
           echo "ecr_repository_name=$ECR_REPO_NAME" >> $GITHUB_OUTPUT
-          echo "ecr_registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
           echo "✅ Set ECR outputs"
         else
           echo "ERROR: ecr_repository_url is empty"
