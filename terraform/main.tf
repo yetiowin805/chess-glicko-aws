@@ -29,13 +29,7 @@ data "aws_subnets" "default" {
 
 # S3 Bucket for data storage
 resource "aws_s3_bucket" "chess_data" {
-  bucket = "${var.project_name}-data-${random_string.bucket_suffix.result}"
-}
-
-resource "random_string" "bucket_suffix" {
-  length  = 8
-  upper   = false
-  special = false
+  bucket = "${var.project_name}-data"
 }
 
 resource "aws_s3_bucket_versioning" "chess_data" {
