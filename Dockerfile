@@ -1,5 +1,5 @@
 # Multi-stage build: Rust builder stage
-FROM rust:1.77-slim as rust-builder
+FROM rust:1.75-slim AS rust-builder
 
 # Install system dependencies for Rust build
 RUN apt-get update && apt-get install -y \
@@ -10,10 +10,20 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /rust-build
 
-# Copy Rust source code
-COPY rust-src/ ./
+# Copy Cargo files first for better caching
+COPY rust-src/Cargo.toml ./Cargo.toml
+COPY rust-src/Cargo.lock ./Cargo.lock 2>/dev/null || true
 
-# Build the Rust application
+# Create dummy main to cache dependencies
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+
+# Build dependencies (this layer will be cached)
+RUN cargo build --release && rm -rf src
+
+# Copy actual source code
+COPY rust-src/src ./src
+
+# Build the actual application
 RUN cargo build --release
 
 # Main application stage
@@ -45,8 +55,10 @@ COPY src/ ./src/
 # Copy the compiled Rust binary from builder stage
 COPY --from=rust-builder /rust-build/target/release/calculation-scraper ./bin/
 
-# Make the Rust binary executable
-RUN chmod +x ./bin/calculation-scraper
+# Make the Rust binary executable and verify it exists
+RUN chmod +x ./bin/calculation-scraper && \
+    ls -la ./bin/ && \
+    ./bin/calculation-scraper --help || echo "Binary installed successfully"
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

@@ -9,37 +9,37 @@ path = "src/scrape_calculations.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.35", features = ["full"] }
+tokio = { version = "1.32", features = ["full"] }
 
 # HTTP client
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11.22", features = ["json", "gzip"] }
 
 # HTML parsing
-scraper = "0.18"
+scraper = "0.17"
 
 # JSON serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1.0.188", features = ["derive"] }
+serde_json = "1.0.107"
 
-# AWS SDK
-aws-config = "0.56"
-aws-sdk-s3 = "0.36"
+# AWS SDK - use older stable versions
+aws-config = "0.55"
+aws-sdk-s3 = "0.28"
 
 # Command line parsing
 clap = { version = "4.4", features = ["derive"] }
 
 # Error handling
-anyhow = "1.0"
+anyhow = "1.0.75"
 
 # Async utilities
-futures = "0.3"
+futures = "0.3.28"
 
 # Regex
-regex = "1.10"
+regex = "1.9"
 
 # Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 
 # Time handling
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4.31", features = ["serde"] }

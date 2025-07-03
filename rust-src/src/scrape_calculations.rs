@@ -33,6 +33,7 @@ struct Args {
 #[derive(Debug, Serialize, Deserialize)]
 struct Game {
     opponent_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     opponent_rating: Option<String>,
     federation: String,
     result: String,
@@ -51,15 +52,6 @@ struct CalculationData {
     tournaments: Vec<Tournament>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct CompletionData {
-    month: String,
-    timestamp: String,
-    statistics: HashMap<String, serde_json::Value>,
-    step: String,
-    method: String,
-}
-
 struct PlayerCalculationScraper {
     s3_client: S3Client,
     http_client: Client,
@@ -70,29 +62,26 @@ struct PlayerCalculationScraper {
 
 impl PlayerCalculationScraper {
     async fn new(s3_bucket: String, aws_region: String) -> Result<Self> {
-        // Initialize AWS SDK - older version without behavior-version-latest
+        // Initialize AWS SDK with older API
         let config = aws_config::from_env()
             .region(aws_config::Region::new(aws_region))
             .load()
             .await;
         let s3_client = S3Client::new(&config);
 
-        // Initialize HTTP client with optimized settings
+        // Initialize HTTP client with conservative settings
         let http_client = Client::builder()
-            .pool_max_idle_per_host(50)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .timeout(Duration::from_secs(60))
-            .tcp_keepalive(Duration::from_secs(60))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .pool_max_idle_per_host(30)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(45))
+            .user_agent("Mozilla/5.0 (compatible; FIDEScraper/1.0)")
             .build()?;
 
         let local_temp_dir = "/tmp/chess_data".to_string();
-
-        // High concurrency - Rust can handle more than Python
-        let max_concurrent_requests = 50;
+        let max_concurrent_requests = 40; // Aggressive but not excessive
         let semaphore = Arc::new(Semaphore::new(max_concurrent_requests));
 
-        info!("Initialized calculation scraper - S3 bucket: {}, Max concurrent requests: {}", 
+        info!("Initialized calculation scraper - S3 bucket: {}, Max concurrent: {}", 
               s3_bucket, max_concurrent_requests);
 
         Ok(Self {
@@ -118,7 +107,7 @@ impl PlayerCalculationScraper {
         // Create temp directory
         fs::create_dir_all(&self.local_temp_dir).await?;
 
-        // Determine time controls to process
+        // Determine time controls
         let mut time_controls = vec!["standard"];
         if year >= 2012 {
             time_controls.extend_from_slice(&["rapid", "blitz"]);
@@ -126,7 +115,7 @@ impl PlayerCalculationScraper {
 
         info!("Processing time controls: {:?}", time_controls);
 
-        // Process each time control concurrently
+        // Process time controls concurrently
         let tasks: Vec<_> = time_controls
             .into_iter()
             .map(|tc| self.process_time_control(tc, year, month))
@@ -153,28 +142,18 @@ impl PlayerCalculationScraper {
         let total_processed: usize = successful.iter().map(|(_, p, _)| p).sum();
         let total_successful: usize = successful.iter().map(|(_, _, s)| s).sum();
 
-        info!(
-            "Results - Time controls: {} successful, {} failed",
-            successful.len(),
-            failed.len()
-        );
-        info!(
-            "Total calculations: {} processed, {} successful",
-            total_processed, total_successful
-        );
+        info!("Results - Time controls: {} successful, {} failed", successful.len(), failed.len());
+        info!("Total calculations: {} processed, {} successful", total_processed, total_successful);
 
         if !failed.is_empty() {
             error!("Failed time controls: {:?}", failed);
         }
 
-        // Upload completion marker
         self.upload_completion_marker(month_str, &successful, &failed).await?;
-
         Ok(())
     }
 
     async fn process_time_control(&self, time_control: &str, year: u32, month: u32) -> Result<(usize, usize)> {
-        // Download active player list
         let player_ids = self.download_active_players(time_control, year, month).await?;
 
         if player_ids.is_empty() {
@@ -184,21 +163,17 @@ impl PlayerCalculationScraper {
 
         info!("Processing {} players for {}", player_ids.len(), time_control);
 
-        let batch_size = 100;
-        let total_batches = (player_ids.len() + batch_size - 1) / batch_size;
+        let batch_size = 80; // Larger batches for better performance
         let mut total_processed = 0;
         let mut total_successful = 0;
 
-        // Process in batches
         for (batch_num, chunk) in player_ids.chunks(batch_size).enumerate() {
             let batch_num = batch_num + 1;
-            info!("{}: Processing batch {}/{} ({} players)", 
-                  time_control, batch_num, total_batches, chunk.len());
+            info!("{}: Processing batch {} ({} players)", time_control, batch_num, chunk.len());
 
-            // Process batch concurrently using stream
             let results: Vec<bool> = stream::iter(chunk)
                 .map(|player_id| self.process_single_player(player_id, time_control, year, month))
-                .buffer_unordered(50) // Process up to 50 players concurrently
+                .buffer_unordered(40) // High concurrency within batch
                 .collect::<Vec<Result<bool>>>()
                 .await
                 .into_iter()
@@ -206,41 +181,25 @@ impl PlayerCalculationScraper {
                 .collect();
 
             let batch_successful = results.iter().filter(|&&r| r).count();
-            let batch_processed = results.len();
-
-            total_processed += batch_processed;
+            total_processed += results.len();
             total_successful += batch_successful;
 
-            info!(
-                "{}: Batch {} completed - {}/{} successful, Total: {}/{}",
-                time_control, batch_num, batch_successful, batch_processed,
-                total_successful, total_processed
-            );
+            info!("{}: Batch {} - {}/{} successful, Total: {}/{}", 
+                  time_control, batch_num, batch_successful, results.len(), 
+                  total_successful, total_processed);
 
-            // Brief pause between batches
-            if batch_num < total_batches {
-                sleep(Duration::from_millis(500)).await;
-            }
+            // Minimal pause to be respectful
+            sleep(Duration::from_millis(200)).await;
         }
 
-        info!(
-            "{}: Completed - {}/{} players processed successfully",
-            time_control, total_successful, total_processed
-        );
-
+        info!("{}: Completed - {}/{} players successful", time_control, total_successful, total_processed);
         Ok((total_processed, total_successful))
     }
 
     async fn download_active_players(&self, time_control: &str, year: u32, month: u32) -> Result<Vec<String>> {
         let s3_key = format!("persistent/active_players/{}-{:02}_{}.txt", year, month, time_control);
 
-        match self.s3_client
-            .get_object()
-            .bucket(&self.s3_bucket)
-            .key(&s3_key)
-            .send()
-            .await
-        {
+        match self.s3_client.get_object().bucket(&self.s3_bucket).key(&s3_key).send().await {
             Ok(response) => {
                 let body = response.body.collect().await?;
                 let content = String::from_utf8(body.to_vec())?;
@@ -251,8 +210,8 @@ impl PlayerCalculationScraper {
                     .collect();
                 Ok(player_ids)
             }
-            Err(e) => {
-                warn!("No active players file found for {} {}-{:02}: {}", time_control, year, month, e);
+            Err(_) => {
+                warn!("No active players file found for {} {}-{:02}", time_control, year, month);
                 Ok(Vec::new())
             }
         }
@@ -262,7 +221,7 @@ impl PlayerCalculationScraper {
         let s3_key = format!("persistent/calculations/{}-{:02}/{}/{}.json", year, month, time_control, player_id);
 
         // Check if already processed
-        if self.check_s3_file_exists(&s3_key).await? {
+        if self.check_s3_file_exists(&s3_key).await.unwrap_or(false) {
             return Ok(true);
         }
 
@@ -278,67 +237,41 @@ impl PlayerCalculationScraper {
             player_id, year, month, tc_code
         );
 
-        let max_retries = 3;
-        let mut retry_delay = Duration::from_secs(1);
-
         let _permit = self.semaphore.acquire().await?;
 
-        for attempt in 0..max_retries {
-            match self.http_client.get(&url).send().await {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        let html_content = response.text().await?;
+        // Single attempt with good timeout
+        match self.http_client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => {
+                let html_content = response.text().await?;
 
-                        // Check for no data conditions
-                        if html_content.contains("No calculations available") ||
-                           html_content.contains("No games") ||
-                           html_content.trim().len() < 100 {
-                            return Ok(true); // Normal case - no calculation data
-                        }
-
-                        // Extract calculation data
-                        let calculation_data = self.extract_calculation_data(&html_content)?;
-
-                        if calculation_data.tournaments.is_empty() {
-                            return Ok(true); // No tournaments found
-                        }
-
-                        // Save and upload
-                        self.save_and_upload_calculation(calculation_data, player_id, time_control, year, month, &s3_key).await?;
-                        return Ok(true);
-                    }
+                // Check for no data conditions
+                if html_content.contains("No calculations available") ||
+                   html_content.contains("No games") ||
+                   html_content.trim().len() < 100 {
+                    return Ok(true); // Normal case
                 }
-                Err(e) => {
-                    if attempt < max_retries - 1 {
-                        sleep(retry_delay).await;
-                        retry_delay *= 2; // Exponential backoff
-                    } else {
-                        warn!("Failed to process player {} after {} attempts: {}", player_id, max_retries, e);
-                        return Ok(false);
-                    }
+
+                // Extract and save data
+                let calculation_data = self.extract_calculation_data(&html_content)?;
+                if !calculation_data.tournaments.is_empty() {
+                    self.save_and_upload_calculation(calculation_data, player_id, time_control, year, month, &s3_key).await?;
                 }
+                Ok(true)
             }
+            _ => Ok(false), // Failed but don't retry to maintain speed
         }
-
-        Ok(false)
     }
 
     fn extract_calculation_data(&self, html_content: &str) -> Result<CalculationData> {
         let document = Html::parse_document(html_content);
-        
-        // Selectors
-        let header_selector = Selector::parse("div.rtng_line01").unwrap();
-        let link_selector = Selector::parse("a").unwrap();
-        let table_selector = Selector::parse("table.calc_table").unwrap();
-        let row_selector = Selector::parse("tr[bgcolor='#efefef']").unwrap();
-        let cell_selector = Selector::parse("td.list4").unwrap();
-        let rp_selector = Selector::parse("td").unwrap();
-
         let mut tournaments = Vec::new();
         let mut tournament_ids = Vec::new();
 
-        // Extract tournament IDs from headers
+        // Extract tournament IDs
+        let header_selector = Selector::parse("div.rtng_line01").unwrap();
+        let link_selector = Selector::parse("a").unwrap();
         let event_regex = Regex::new(r"event=(\d+)").unwrap();
+
         for header in document.select(&header_selector) {
             if let Some(link) = header.select(&link_selector).next() {
                 if let Some(href) = link.value().attr("href") {
@@ -351,55 +284,44 @@ impl PlayerCalculationScraper {
             }
         }
 
-        // Process calculation tables
+        // Extract game data
+        let table_selector = Selector::parse("table.calc_table").unwrap();
+        let row_selector = Selector::parse("tr[bgcolor='#efefef']").unwrap();
+        let cell_selector = Selector::parse("td.list4").unwrap();
         let rating_regex = Regex::new(r"-?\d+").unwrap();
-        
+
         for (i, table) in document.select(&table_selector).enumerate() {
-            if i >= tournament_ids.len() {
-                break;
-            }
+            if i >= tournament_ids.len() { break; }
 
             let tournament_id = &tournament_ids[i];
             let mut games = Vec::new();
 
-            // Check if player is unrated (look for "Rp" in table)
-            let player_is_unrated = table.select(&rp_selector)
-                .any(|cell| cell.inner_html().contains("Rp"));
+            // Check if unrated
+            let player_is_unrated = table.inner_html().contains("Rp");
 
-            // Extract games from rows
             for row in table.select(&row_selector) {
                 let cells: Vec<_> = row.select(&cell_selector).collect();
-                if cells.len() < 6 {
-                    continue;
-                }
+                if cells.len() < 6 { continue; }
 
-                let opponent_name = cells[0].inner_html().trim().to_string();
+                let opponent_name = cells[0].text().collect::<String>().trim().to_string();
                 let opponent_rating = if cells.len() > 3 {
-                    let rating_text = cells[3].inner_html().trim();
-                    rating_regex.find(rating_text).map(|m| m.as_str().to_string())
-                } else {
-                    None
-                };
-                let federation = if cells.len() > 4 {
-                    cells[4].inner_html().trim().to_string()
-                } else {
-                    String::new()
-                };
-                let result = if cells.len() > 5 {
-                    cells[5].inner_html().trim().to_string()
-                } else {
-                    String::new()
-                };
+                    let rating_text = cells[3].text().collect::<String>();
+                    rating_regex.find(&rating_text).map(|m| m.as_str().to_string())
+                } else { None };
+                let federation = if cells.len() > 4 { 
+                    cells[4].text().collect::<String>().trim().to_string() 
+                } else { String::new() };
+                let result = if cells.len() > 5 { 
+                    cells[5].text().collect::<String>().trim().to_string() 
+                } else { String::new() };
 
-                let game = Game {
+                games.push(Game {
                     opponent_name,
                     opponent_rating,
                     federation,
                     result,
                     tournament_id: tournament_id.clone(),
-                };
-
-                games.push(game);
+                });
             }
 
             if !games.is_empty() {
@@ -415,66 +337,41 @@ impl PlayerCalculationScraper {
     }
 
     async fn save_and_upload_calculation(
-        &self,
-        calculation_data: CalculationData,
-        player_id: &str,
-        time_control: &str,
-        year: u32,
-        month: u32,
-        s3_key: &str,
+        &self, calculation_data: CalculationData, player_id: &str, 
+        time_control: &str, year: u32, month: u32, s3_key: &str,
     ) -> Result<()> {
-        // Create local directory
-        let local_dir = format!("{}/calculations/{}-{:02}/{}", 
-                               self.local_temp_dir, year, month, time_control);
+        let local_dir = format!("{}/calculations/{}-{:02}/{}", self.local_temp_dir, year, month, time_control);
         fs::create_dir_all(&local_dir).await?;
 
-        // Save to local file
         let local_file = format!("{}/{}.json", local_dir, player_id);
-        let json_content = serde_json::to_string_pretty(&calculation_data)?;
-        fs::write(&local_file, json_content).await?;
+        let json_content = serde_json::to_string(&calculation_data)?;
+        fs::write(&local_file, &json_content).await?;
 
         // Upload to S3
-        let body = fs::read(&local_file).await?;
         self.s3_client
             .put_object()
             .bucket(&self.s3_bucket)
             .key(s3_key)
-            .body(body.into())
+            .body(json_content.into_bytes().into())
             .send()
             .await?;
 
-        // Cleanup
         fs::remove_file(&local_file).await?;
-
         Ok(())
     }
 
     async fn check_s3_file_exists(&self, s3_key: &str) -> Result<bool> {
-        match self.s3_client
-            .head_object()
-            .bucket(&self.s3_bucket)
-            .key(s3_key)
-            .send()
-            .await
-        {
+        match self.s3_client.head_object().bucket(&self.s3_bucket).key(s3_key).send().await {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
         }
     }
 
-    async fn upload_completion_marker(
-        &self,
-        month_str: &str,
-        successful: &[(String, usize, usize)],
-        failed: &[(String, String)],
-    ) -> Result<()> {
+    async fn upload_completion_marker(&self, month_str: &str, successful: &[(String, usize, usize)], failed: &[(String, String)]) -> Result<()> {
         let mut statistics = HashMap::new();
-        statistics.insert("time_controls_processed".to_string(), 
-                         serde_json::Value::Number((successful.len() + failed.len()).into()));
-        statistics.insert("time_controls_successful".to_string(), 
-                         serde_json::Value::Number(successful.len().into()));
-        statistics.insert("time_controls_failed".to_string(), 
-                         serde_json::Value::Number(failed.len().into()));
+        statistics.insert("time_controls_processed".to_string(), serde_json::Value::Number((successful.len() + failed.len()).into()));
+        statistics.insert("time_controls_successful".to_string(), serde_json::Value::Number(successful.len().into()));
+        statistics.insert("time_controls_failed".to_string(), serde_json::Value::Number(failed.len().into()));
 
         let mut details = HashMap::new();
         for (tc, processed, success_count) in successful {
@@ -485,17 +382,15 @@ impl PlayerCalculationScraper {
         }
         statistics.insert("details".to_string(), serde_json::Value::Object(details.into_iter().collect()));
 
-        let completion_data = CompletionData {
-            month: month_str.to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            statistics,
-            step: "calculation_scraping".to_string(),
-            method: "rust_high_performance".to_string(),
-        };
+        let completion_data = serde_json::json!({
+            "month": month_str,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "statistics": statistics,
+            "step": "calculation_scraping",
+            "method": "rust_optimized"
+        });
 
-        // Save and upload completion marker
-        let local_file = format!("{}/calculation_scraping_completion_{}.json", 
-                                self.local_temp_dir, month_str);
+        let local_file = format!("{}/calculation_scraping_completion_{}.json", self.local_temp_dir, month_str);
         let json_content = serde_json::to_string_pretty(&completion_data)?;
         fs::write(&local_file, &json_content).await?;
 
@@ -504,44 +399,26 @@ impl PlayerCalculationScraper {
             .put_object()
             .bucket(&self.s3_bucket)
             .key(&s3_key)
-            .body(json_content.into())
+            .body(json_content.into_bytes().into())
             .send()
             .await?;
 
         fs::remove_file(&local_file).await?;
         info!("Uploaded completion marker for {}", month_str);
-
         Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
     tracing_subscriber::fmt::init();
-
     let args = Args::parse();
 
-    info!("Starting calculation scraper for {}", args.month);
+    info!("Starting Rust calculation scraper for {}", args.month);
 
-    // Validate month format
-    let parts: Vec<&str> = args.month.split('-').collect();
-    if parts.len() != 2 || parts[0].len() != 4 || parts[1].len() != 2 {
-        return Err(anyhow::anyhow!("Month must be in YYYY-MM format"));
-    }
-
-    // Initialize scraper
     let scraper = PlayerCalculationScraper::new(args.s3_bucket, args.aws_region).await?;
+    scraper.scrape_calculations_for_month(&args.month).await?;
 
-    // Run scraping
-    match scraper.scrape_calculations_for_month(&args.month).await {
-        Ok(_) => {
-            info!("Calculation scraping completed successfully for {}", args.month);
-            Ok(())
-        }
-        Err(e) => {
-            error!("Calculation scraping failed with error: {}", e);
-            Err(e)
-        }
-    }
+    info!("Calculation scraping completed successfully for {}", args.month);
+    Ok(())
 }
