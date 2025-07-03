@@ -298,6 +298,7 @@ data "aws_iam_policy_document" "eventbridge_policy" {
 }
 
 resource "aws_iam_role_policy" "eventbridge_policy" {
+  name   = "${var.project_name}-eventbridge-policy" 
   role   = aws_iam_role.eventbridge_role.id
   policy = data.aws_iam_policy_document.eventbridge_policy.json
 }
