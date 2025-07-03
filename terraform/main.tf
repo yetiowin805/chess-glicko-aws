@@ -259,22 +259,29 @@ resource "aws_cloudwatch_event_rule" "monthly_pipeline" {
   schedule_expression = var.schedule_expression
 }
 
-# EventBridge IAM Role
-resource "aws_iam_role" "eventbridge_role" {
-  name = "${var.project_name}-eventbridge-role"
-  
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "events.amazonaws.com"
-        }
-      }
+# EventBridge IAM Policy - Using data source to prevent accumulation
+data "aws_iam_policy_document" "eventbridge_policy" {
+  statement {
+    effect = "Allow"
+    actions = ["ecs:RunTask"]
+    resources = [
+      "arn:aws:ecs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:task-definition/${var.project_name}-task:*"
     ]
-  })
+  }
+  
+  statement {
+    effect = "Allow"
+    actions = ["iam:PassRole"]
+    resources = [
+      aws_iam_role.ecs_execution_role.arn,
+      aws_iam_role.ecs_task_role.arn
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "eventbridge_policy" {
+  role   = aws_iam_role.eventbridge_role.id
+  policy = data.aws_iam_policy_document.eventbridge_policy.json
 }
 
 resource "aws_iam_role_policy" "eventbridge_policy" {
