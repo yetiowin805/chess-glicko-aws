@@ -13,8 +13,8 @@ WORKDIR /rust-build
 # Copy Cargo.toml first for better caching
 COPY rust-src/Cargo.toml ./Cargo.toml
 
-# Create dummy main to cache dependencies
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+# Create dummy scrape_calculations.rs to match the binary target in Cargo.toml
+RUN mkdir -p src && echo "fn main() {}" > src/scrape_calculations.rs
 
 # Build dependencies first (this layer will be cached)
 RUN cargo build --release && rm -rf src target/release/deps/calculation*
