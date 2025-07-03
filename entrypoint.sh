@@ -54,24 +54,38 @@ fi
 
 log "Step 2 completed successfully"
 
-# Step 3: Scrape Tournament Data
-log "Step 3: Scraping tournament data..."
+# Step 3: Scrape Tournament IDs
+log "Step 3: Scraping tournament IDs..."
 python src/fide_scraper.py \
     --month "$PROCESS_MONTH" \
     --s3_bucket "$S3_BUCKET" \
     --aws_region "$AWS_REGION"
 
 if [ $? -ne 0 ]; then
-    log "ERROR: Tournament data scraping failed"
+    log "ERROR: Tournament ID scraping failed"
     exit 1
 fi
 
 log "Step 3 completed successfully"
 
+# Step 4: Process Tournament Data
+log "Step 4: Processing tournament data..."
+python src/tournament_scraper.py \
+    --month "$PROCESS_MONTH" \
+    --s3_bucket "$S3_BUCKET" \
+    --aws_region "$AWS_REGION"
+
+if [ $? -ne 0 ]; then
+    log "ERROR: Tournament data processing failed"
+    exit 1
+fi
+
+log "Step 4 completed successfully"
+
 # Future steps would go here:
-# Step 4: Download game data  
-# Step 5: Calculate ratings
-# Step 6: Upload results
+# Step 5: Download game data  
+# Step 6: Calculate ratings
+# Step 7: Upload results
 
 # Upload the completion marker to show all completed steps
 if [ -n "$S3_BUCKET" ]; then
@@ -84,12 +98,19 @@ Pipeline completed at $(date -u +%Y-%m-%dT%H:%M:%SZ) for month $PROCESS_MONTH
 Steps completed:
 1. Downloaded player data from FIDE
 2. Processed player data to JSON format
-3. Scraped tournament data for all countries
+3. Scraped tournament IDs for all countries
+4. Processed tournament data and extracted player information
 
 Files created:
 - s3://$S3_BUCKET/persistent/player_info/raw/$PROCESS_MONTH.txt
 - s3://$S3_BUCKET/persistent/player_info/processed/$PROCESS_MONTH.txt
-- s3://$S3_BUCKET/persistent/tournament_data/raw/[country]/$PROCESS_MONTH/tournaments.txt (for each country)
+- s3://$S3_BUCKET/persistent/tournament_data/raw/[country]/$PROCESS_MONTH/tournaments.txt
+- s3://$S3_BUCKET/persistent/tournament_data/processed/[time_control]/$PROCESS_MONTH/[tournament_id].txt
+
+Data structure:
+- Tournament data is organized by time control (standard/rapid/blitz)
+- Each tournament file contains JSON lines with player ID and name
+- Player data is processed and ready for rating calculations
 EOF
     
     aws s3 cp /tmp/completion.txt "s3://$S3_BUCKET/results/$PROCESS_MONTH/completion.txt"
@@ -101,7 +122,7 @@ log "Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
 if [ -n "$SNS_TOPIC_ARN" ]; then
     aws sns publish \
         --topic-arn "$SNS_TOPIC_ARN" \
-        --message "Chess Rating Pipeline completed successfully for $PROCESS_MONTH. Downloaded player data, processed it, and scraped tournament data." \
+        --message "Chess Rating Pipeline completed successfully for $PROCESS_MONTH. Downloaded player data, processed it, scraped tournament IDs, and processed tournament data with player information." \
         --subject "Chess Pipeline Success - $PROCESS_MONTH" \
         --region "$AWS_REGION" || log "Warning: Failed to send SNS notification"
 fi
