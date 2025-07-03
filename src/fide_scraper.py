@@ -189,15 +189,18 @@ class FIDETournamentScraper:
             logger.debug(f"Parsed JSON structure for {country}: {type(data)} with keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
             
             # Extract tournament IDs from the data
+            tournaments_data = None
             if "data" in data and isinstance(data["data"], list):
-                logger.info(f"Found {len(data['data'])} tournament entries for {country}")
-                for i, tournament in enumerate(data["data"]):
-                    if isinstance(tournament, list) and len(tournament) > 0:
-                        tournament_ids.append(str(tournament[0]))
-                        if i < 3:  # Log first few for debugging
-                            logger.debug(f"Tournament {i} for {country}: {tournament[0]}")
+                # Browser/local format
+                tournaments_data = data["data"]
+                logger.debug(f"Using 'data' field for {country}: {len(tournaments_data)} tournaments")
+            elif "aaData" in data and isinstance(data["aaData"], list):
+                # Server/AWS format
+                tournaments_data = data["aaData"]
+                logger.debug(f"Using 'aaData' field for {country}: {len(tournaments_data)} tournaments")
             else:
-                logger.warning(f"No 'data' field or invalid structure for {country}. Available keys: {list(data.keys()) if isinstance(data, dict) else 'none'}")
+                logger.warning(f"Unknown response format for {country}. Available keys: {list(data.keys()) if isinstance(data, dict) else 'none'}")
+                return []
             
             return tournament_ids
             
