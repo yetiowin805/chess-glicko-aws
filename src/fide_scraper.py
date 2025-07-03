@@ -12,8 +12,8 @@ from typing import List
 from botocore.exceptions import ClientError
 from countries import countries
 
-# Configure detailed logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 DEFAULT_AWS_REGION = "us-east-2"
@@ -23,13 +23,10 @@ class FIDETournamentScraper:
         self.s3_bucket = s3_bucket
         self.s3_client = boto3.client('s3', region_name=aws_region)
         self.local_temp_dir = "/tmp/chess_data"
-        
-        # Async configuration - match your local script
-        self.max_concurrent_requests = 5  # Reduced for better debugging
+        self.max_concurrent_requests = 5
         self.semaphore = asyncio.Semaphore(self.max_concurrent_requests)
         
         logger.info(f"Initialized scraper - S3 bucket: {s3_bucket}, Region: {aws_region}")
-        logger.info(f"Max concurrent requests: {self.max_concurrent_requests}")
         logger.info(f"Total countries to process: {len(countries)}")
         
     def is_valid_rating_period(self, year: int, month: int) -> bool:
@@ -46,7 +43,6 @@ class FIDETournamentScraper:
         elif year == 2012:
             valid = (month < 7 and month % 2 == 1) or month >= 7
         
-        logger.debug(f"Rating period validation for {year}-{month:02d}: {valid}")
         return valid
 
     async def scrape_tournaments_for_month(self, month_str):
@@ -61,14 +57,10 @@ class FIDETournamentScraper:
             
             # Setup local temp directory
             os.makedirs(self.local_temp_dir, exist_ok=True)
-            logger.debug(f"Created temp directory: {self.local_temp_dir}")
             
-            # Configure async session exactly like your local script
+            # Configure async session
             connector = aiohttp.TCPConnector(limit=100)
             timeout = aiohttp.ClientTimeout(total=60)
-            
-            logger.info(f"Starting scraping with {len(countries)} countries")
-            logger.debug(f"First 10 countries: {countries[:10]}")
             
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 # Create tasks for all countries
@@ -77,18 +69,15 @@ class FIDETournamentScraper:
                     for country in countries
                 ]
                 
-                logger.info(f"Created {len(tasks)} tasks")
+                logger.info(f"Processing {len(tasks)} countries")
                 
                 # Execute all tasks concurrently
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 
-                logger.info(f"Completed all tasks, processing {len(results)} results")
-                
-                # Process results and log summary with detailed breakdown
+                # Process results and log summary
                 successful = []
                 failed = []
                 skipped = []
-                errors = []
                 
                 for i, result in enumerate(results):
                     country = countries[i]
@@ -98,19 +87,13 @@ class FIDETournamentScraper:
                         skipped.append(country)
                     elif isinstance(result, Exception):
                         failed.append((country, str(result)))
-                    else:
-                        errors.append((country, result))
                 
-                logger.info(f"=== DETAILED RESULTS BREAKDOWN ===")
-                logger.info(f"Successful ({len(successful)}): {successful[:10]}{'...' if len(successful) > 10 else ''}")
-                logger.info(f"Skipped ({len(skipped)}): {skipped[:10]}{'...' if len(skipped) > 10 else ''}")
-                logger.info(f"Failed ({len(failed)}): {failed[:5]}{'...' if len(failed) > 5 else ''}")
-                logger.info(f"Errors ({len(errors)}): {errors[:5]}{'...' if len(errors) > 5 else ''}")
+                logger.info(f"Results - Successful: {len(successful)}, Skipped: {len(skipped)}, Failed: {len(failed)}")
                 
-                # Log detailed failure information
+                # Log failures for debugging
                 if failed:
-                    logger.error("=== FAILURE DETAILS ===")
-                    for country, error in failed[:10]:  # Show first 10 failures
+                    logger.error(f"Failed countries: {[f[0] for f in failed[:10]]}")
+                    for country, error in failed[:3]:  # Log first 3 failure details
                         logger.error(f"  {country}: {error}")
                 
                 # Upload completion marker
@@ -123,19 +106,16 @@ class FIDETournamentScraper:
             raise
 
     async def _scrape_country_tournaments(self, session: aiohttp.ClientSession, country: str, year: int, month: int):
-        """Scrape tournament data for a specific country - matches your local script"""
+        """Scrape tournament data for a specific country"""
         month_str = f"{month:02d}"
-        logger.debug(f"Processing {country} for {year}-{month_str}")
         
         if not self.is_valid_rating_period(year, month):
-            logger.debug(f"Invalid rating period for {country}, skipping")
             return None
             
         s3_key = f"persistent/tournament_data/raw/{country}/{year}-{month_str}/tournaments.txt"
         
         # Check if data already exists in S3
         if await self._check_s3_file_exists_async(s3_key):
-            logger.debug(f"Tournament data already exists for {country} {year}-{month_str}")
             return None  # Skipped
         
         api_url = "https://ratings.fide.com/a_tournaments.php"
@@ -144,131 +124,81 @@ class FIDETournamentScraper:
             "period": f"{year}-{month_str}-01"
         }
         
-        logger.debug(f"Making request for {country}: {api_url} with params {params}")
-        
         try:
             async with self.semaphore:
-                # Use exactly the same headers as your local script
                 headers = {
                     "Accept": "application/json, text/javascript, */*; q=0.01",
                     "X-Requested-With": "XMLHttpRequest",
                     "Referer": f"https://ratings.fide.com/rated_tournaments.phtml?country={country}&period={year}-{month_str}-01"
                 }
                 
-                logger.debug(f"Request headers for {country}: {headers}")
-                
                 async with session.get(api_url, params=params, headers=headers, timeout=30) as api_response:
-                    logger.debug(f"Response status for {country}: {api_response.status}")
-                    logger.debug(f"Response headers for {country}: {dict(api_response.headers)}")
-                    
                     api_response.raise_for_status()
                     
-                    # Read the raw bytes first (like your local script)
                     raw_content = await api_response.read()
                     if not raw_content:
-                        logger.error(f"Empty response received for {country} {year}-{month_str}")
+                        logger.warning(f"Empty response for {country}")
                         return Exception("Empty response")
                     
-                    logger.debug(f"Raw content length for {country}: {len(raw_content)} bytes")
-                    
-                    # Decode the content, handling gzip compression
                     content = await api_response.text()
-                    logger.debug(f"Decoded content length for {country}: {len(content)} characters")
-                    logger.debug(f"Raw content preview for {country}: {content[:300]}...")
                     
         except aiohttp.ClientError as e:
-            logger.error(f"HTTP error occurred for {country} {year}-{month_str}: {str(e)}")
+            logger.warning(f"HTTP error for {country}: {str(e)}")
             return e
         except asyncio.TimeoutError:
-            logger.error(f"Request timed out for {country} {year}-{month_str}")
+            logger.warning(f"Timeout for {country}")
             return Exception("Timeout")
         except Exception as e:
-            logger.error(f"Unexpected error for {country} {year}-{month_str}: {str(e)}", exc_info=True)
+            logger.error(f"Unexpected error for {country}: {str(e)}")
             return e
 
-        # Process exactly like your local script
+        # Process response content
         try:
-            logger.debug(f"Processing response content for {country}")
-            
-            # Log original content before processing
-            logger.debug(f"Original content for {country}: {content[:500]}...")
-            
+            # Clean content
             content = content.replace("</a>", "")
             content = content.replace("&lt;", "<")
             content = content.replace("&gt;", ">")
-            
-            logger.debug(f"Cleaned content for {country}: {content[:500]}...")
 
             try:
                 data = json.loads(content)
-                logger.debug(f"JSON parsed successfully for {country}")
-                logger.debug(f"JSON structure for {country}: {type(data)}")
-                
-                if isinstance(data, dict):
-                    logger.debug(f"JSON keys for {country}: {list(data.keys())}")
-                    for key, value in data.items():
-                        if isinstance(value, list):
-                            logger.debug(f"  {key}: list with {len(value)} items")
-                        else:
-                            logger.debug(f"  {key}: {type(value)} = {value}")
-                else:
-                    logger.debug(f"JSON data for {country} is not a dict: {data}")
-                    
             except json.JSONDecodeError as je:
                 logger.error(f"JSON decode failed for {country}: {str(je)}")
-                logger.error(f"Content that failed: {content}")
                 return je
 
             tournament_ids = []
 
-            # Extract tournament IDs from the data (your local script format)
+            # Extract tournament IDs from the data
             if "data" in data and isinstance(data["data"], list):
-                logger.info(f"Found 'data' field for {country} with {len(data['data'])} tournaments")
-                for i, tournament in enumerate(data["data"]):
+                for tournament in data["data"]:
                     if isinstance(tournament, list) and len(tournament) > 0:
                         tournament_ids.append(str(tournament[0]))
-                        if i < 3:  # Log first few tournaments
-                            logger.debug(f"  Tournament {i} for {country}: {tournament[0]} (full: {tournament})")
-                            
-                logger.info(f"Extracted {len(tournament_ids)} tournament IDs for {country}")
+                        
             elif "aaData" in data and isinstance(data["aaData"], list):
-                logger.info(f"Found 'aaData' field for {country} with {len(data['aaData'])} tournaments")
-                for i, tournament in enumerate(data["aaData"]):
+                for tournament in data["aaData"]:
                     if isinstance(tournament, list) and len(tournament) > 0:
                         tournament_ids.append(str(tournament[0]))
-                        if i < 3:  # Log first few tournaments
-                            logger.debug(f"  Tournament {i} for {country}: {tournament[0]} (full: {tournament})")
-                            
-                logger.info(f"Extracted {len(tournament_ids)} tournament IDs from aaData for {country}")
             else:
-                logger.warning(f"No 'data' or 'aaData' field found for {country}")
-                logger.warning(f"Available fields: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
-                # Still return True for success, just no tournaments
+                logger.info(f"No tournaments found for {country}")
                 return True
 
             if tournament_ids:
-                logger.info(f"Saving {len(tournament_ids)} tournaments for {country}")
+                logger.info(f"Found {len(tournament_ids)} tournaments for {country}")
                 
                 # Save to local file
                 local_file = await self._save_tournaments_locally(tournament_ids, country, year, month)
-                logger.debug(f"Saved to local file: {local_file}")
                 
                 # Upload to S3
                 await self._upload_to_s3_async(local_file, s3_key)
-                logger.debug(f"Uploaded to S3: {s3_key}")
                 
                 # Cleanup local file
                 os.remove(local_file)
-                logger.debug(f"Cleaned up local file: {local_file}")
-                
-                logger.info(f"Successfully saved {len(tournament_ids)} tournaments for {country} {year}-{month_str}")
             else:
-                logger.info(f"No tournaments found for {country} {year}-{month_str}")
+                logger.info(f"No tournaments found for {country}")
             
             return True
             
         except Exception as e:
-            logger.error(f"Error processing response for {country} {year}-{month}: {str(e)}", exc_info=True)
+            logger.error(f"Error processing response for {country}: {str(e)}")
             return e
 
     async def _save_tournaments_locally(self, tournament_ids: List[str], country: str, year: int, month: int) -> str:
@@ -279,8 +209,6 @@ class FIDETournamentScraper:
         
         local_file = os.path.join(local_dir, "tournaments.txt")
         
-        logger.debug(f"Saving {len(tournament_ids)} IDs to {local_file}")
-        
         async with aiofiles.open(local_file, "w") as f:
             await f.write("\n".join(tournament_ids))
         
@@ -290,7 +218,6 @@ class FIDETournamentScraper:
         """Async wrapper for checking S3 file existence"""
         loop = asyncio.get_event_loop()
         try:
-            # Fix: Use a lambda to pass keyword arguments correctly
             await loop.run_in_executor(
                 None, 
                 lambda: self.s3_client.head_object(Bucket=self.s3_bucket, Key=s3_key)
@@ -307,9 +234,8 @@ class FIDETournamentScraper:
                 None, 
                 lambda: self.s3_client.upload_file(local_path, self.s3_bucket, s3_key)
             )
-            logger.debug(f"Uploaded {local_path} to S3 as {s3_key}")
         except ClientError as e:
-            logger.error(f"Failed to upload {local_path} to S3: {str(e)}")
+            logger.error(f"Failed to upload to S3: {str(e)}")
             raise
 
     async def _upload_completion_marker(self, month_str: str, successful: int, failed: int, skipped: int):
@@ -325,7 +251,7 @@ class FIDETournamentScraper:
                     "skipped": skipped
                 },
                 "step": "tournament_scraping",
-                "method": "aiohttp_debug"
+                "method": "aiohttp"
             }
             
             local_file = os.path.join(self.local_temp_dir, f"tournament_completion_{month_str}.json")
@@ -365,10 +291,7 @@ def main():
 
     args = parser.parse_args()
     
-    logger.info(f"=== STARTING TOURNAMENT SCRAPER ===")
-    logger.info(f"Month: {args.month}")
-    logger.info(f"S3 Bucket: {args.s3_bucket}")
-    logger.info(f"AWS Region: {args.aws_region}")
+    logger.info(f"Starting tournament scraper for {args.month}")
     
     # Validate month format
     try:
