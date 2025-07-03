@@ -24,9 +24,10 @@ jobs:
   deploy-infrastructure:
     runs-on: ubuntu-latest
     outputs:
-      ecr_repository_url: ${{ steps.terraform-outputs.outputs.ecr_repository_url }}
+      ecr_repository_name: ${{ steps.terraform-outputs.outputs.ecr_repository_name }}
+      ecr_registry: ${{ steps.terraform-outputs.outputs.ecr_registry }}
       ecs_cluster_name: ${{ steps.terraform-outputs.outputs.ecs_cluster_name }}
-      task_definition_arn: ${{ steps.terraform-outputs.outputs.task_definition_arn }}
+      task_definition_family: ${{ steps.terraform-outputs.outputs.task_definition_family }}
       s3_bucket_name: ${{ steps.terraform-outputs.outputs.s3_bucket_name }}
     
     steps:
@@ -127,10 +128,19 @@ jobs:
         echo "TASK_ARN: '$TASK_ARN'"
         echo "S3_BUCKET: '$S3_BUCKET'"
         
-        # Set outputs (with error checking)
+        # Extract components that don't contain secrets
         if [ -n "$ECR_URL" ]; then
-          echo "ecr_repository_url=$ECR_URL" >> $GITHUB_OUTPUT
-          echo "✅ Set ecr_repository_url output"
+          # Extract registry and repository name separately
+          ECR_REGISTRY=$(echo "$ECR_URL" | cut -d'/' -f1)
+          ECR_REPO_NAME=$(echo "$ECR_URL" | cut -d'/' -f2)
+          
+          echo "ECR_REGISTRY: '$ECR_REGISTRY'"
+          echo "ECR_REPO_NAME: '$ECR_REPO_NAME'"
+          
+          # Set sanitized outputs (repository name doesn't contain account ID)
+          echo "ecr_repository_name=$ECR_REPO_NAME" >> $GITHUB_OUTPUT
+          echo "ecr_registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
+          echo "✅ Set ECR outputs"
         else
           echo "ERROR: ecr_repository_url is empty"
           exit 1
@@ -145,8 +155,11 @@ jobs:
         fi
         
         if [ -n "$TASK_ARN" ]; then
-          echo "task_definition_arn=$TASK_ARN" >> $GITHUB_OUTPUT
-          echo "✅ Set task_definition_arn output"
+          # Extract just the task family name (doesn't contain account ID)
+          TASK_FAMILY=$(echo "$TASK_ARN" | cut -d'/' -f2 | cut -d':' -f1)
+          echo "TASK_FAMILY: '$TASK_FAMILY'"
+          echo "task_definition_family=$TASK_FAMILY" >> $GITHUB_OUTPUT
+          echo "✅ Set task_definition_family output"
         else
           echo "ERROR: task_definition_arn is empty"
           exit 1
@@ -183,18 +196,19 @@ jobs:
     - name: Debug Job Dependencies
       run: |
         echo "=== Debugging Job Dependencies ==="
-        echo "ECR Repository URL: '${{ needs.deploy-infrastructure.outputs.ecr_repository_url }}'"
+        echo "ECR Repository Name: '${{ needs.deploy-infrastructure.outputs.ecr_repository_name }}'"
+        echo "ECR Registry: '${{ needs.deploy-infrastructure.outputs.ecr_registry }}'"
         echo "ECS Cluster Name: '${{ needs.deploy-infrastructure.outputs.ecs_cluster_name }}'"
-        echo "Task Definition ARN: '${{ needs.deploy-infrastructure.outputs.task_definition_arn }}'"
+        echo "Task Definition Family: '${{ needs.deploy-infrastructure.outputs.task_definition_family }}'"
         echo "S3 Bucket Name: '${{ needs.deploy-infrastructure.outputs.s3_bucket_name }}'"
         
         # Check if any outputs are empty
-        if [ -z "${{ needs.deploy-infrastructure.outputs.ecr_repository_url }}" ]; then
-          echo "❌ ERROR: ecr_repository_url is empty from previous job"
+        if [ -z "${{ needs.deploy-infrastructure.outputs.ecr_repository_name }}" ]; then
+          echo "❌ ERROR: ecr_repository_name is empty from previous job"
           echo "This indicates a problem with job output passing"
           exit 1
         else
-          echo "✅ ecr_repository_url received successfully"
+          echo "✅ ecr_repository_name received successfully"
         fi
         
         if [ -z "${{ needs.deploy-infrastructure.outputs.ecs_cluster_name }}" ]; then
@@ -211,98 +225,80 @@ jobs:
     - name: Build, tag, and push image to Amazon ECR
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        ECR_REPOSITORY_URL: ${{ needs.deploy-infrastructure.outputs.ecr_repository_url }}
+        ECR_REPOSITORY_NAME: ${{ needs.deploy-infrastructure.outputs.ecr_repository_name }}
         IMAGE_TAG: ${{ github.sha }}
       run: |
         echo "=== Debug ECR Variables ==="
         echo "ECR_REGISTRY: '$ECR_REGISTRY'"
-        echo "ECR_REPOSITORY_URL: '$ECR_REPOSITORY_URL'"
+        echo "ECR_REPOSITORY_NAME: '$ECR_REPOSITORY_NAME'"
         echo "IMAGE_TAG: '$IMAGE_TAG'"
         
-        # If ECR_REPOSITORY_URL is empty, try to get it from AWS directly as fallback
-        if [ -z "$ECR_REPOSITORY_URL" ]; then
-          echo "⚠️  ECR_REPOSITORY_URL is empty, trying to get it from AWS directly..."
-          ECR_REPOSITORY_URL=$(aws ecr describe-repositories \
+        # Check if ECR_REPOSITORY_NAME is empty
+        if [ -z "$ECR_REPOSITORY_NAME" ]; then
+          echo "⚠️  ECR_REPOSITORY_NAME is empty, trying to get it from AWS directly..."
+          ECR_REPOSITORY_NAME=$(aws ecr describe-repositories \
             --repository-names chess-glicko-pipeline \
-            --query 'repositories[0].repositoryUri' \
-            --output text 2>/dev/null || echo "")
+            --query 'repositories[0].repositoryName' \
+            --output text 2>/dev/null || echo "chess-glicko-pipeline")
           
-          if [ -n "$ECR_REPOSITORY_URL" ]; then
-            echo "✅ Found ECR repository URL from AWS: '$ECR_REPOSITORY_URL'"
-          else
-            echo "❌ ERROR: Could not get ECR repository URL from job outputs or AWS directly"
-            echo "Check that the ECR repository exists and Terraform outputs are working"
-            exit 1
-          fi
+          echo "✅ Using ECR repository name: '$ECR_REPOSITORY_NAME'"
         fi
         
-        # Extract repository name from full URL
-        # Expected format: 961341531973.dkr.ecr.region.amazonaws.com/chess-glicko-pipeline
-        REPO_NAME=$(echo "$ECR_REPOSITORY_URL" | cut -d'/' -f2)
-        echo "REPO_NAME: '$REPO_NAME'"
-        
-        # Check if REPO_NAME extraction worked
-        if [ -z "$REPO_NAME" ]; then
-          echo "ERROR: Could not extract repository name from: '$ECR_REPOSITORY_URL'"
-          echo "Expected format: account.dkr.ecr.region.amazonaws.com/repository-name"
+        # Validate we have what we need
+        if [ -z "$ECR_REGISTRY" ] || [ -z "$ECR_REPOSITORY_NAME" ]; then
+          echo "❌ ERROR: Missing required ECR variables"
+          echo "ECR_REGISTRY: '$ECR_REGISTRY'"
+          echo "ECR_REPOSITORY_NAME: '$ECR_REPOSITORY_NAME'"
           exit 1
         fi
         
         echo "=== Building Docker Images ==="
         # Build and tag
-        docker build -t $ECR_REGISTRY/$REPO_NAME:latest .
-        docker build -t $ECR_REGISTRY/$REPO_NAME:$IMAGE_TAG .
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_NAME:latest .
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_NAME:$IMAGE_TAG .
         
         echo "=== Pushing to ECR ==="
         # Push
-        docker push $ECR_REGISTRY/$REPO_NAME:latest
-        docker push $ECR_REGISTRY/$REPO_NAME:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_NAME:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_NAME:$IMAGE_TAG
         
         echo "=== Successfully pushed images ==="
-        echo "  Latest: $ECR_REGISTRY/$REPO_NAME:latest"
-        echo "  Tagged: $ECR_REGISTRY/$REPO_NAME:$IMAGE_TAG"
+        echo "  Latest: $ECR_REGISTRY/$ECR_REPOSITORY_NAME:latest"
+        echo "  Tagged: $ECR_REGISTRY/$ECR_REPOSITORY_NAME:$IMAGE_TAG"
 
     - name: Update ECS Task Definition
       env:
         CLUSTER_NAME: ${{ needs.deploy-infrastructure.outputs.ecs_cluster_name }}
-        ECR_REPOSITORY_URL: ${{ needs.deploy-infrastructure.outputs.ecr_repository_url }}
-        TASK_DEFINITION_ARN: ${{ needs.deploy-infrastructure.outputs.task_definition_arn }}
+        ECR_REPOSITORY_NAME: ${{ needs.deploy-infrastructure.outputs.ecr_repository_name }}
+        TASK_DEFINITION_FAMILY: ${{ needs.deploy-infrastructure.outputs.task_definition_family }}
       run: |
         echo "=== Debug Task Definition Update Variables ==="
         echo "CLUSTER_NAME: '$CLUSTER_NAME'"
-        echo "ECR_REPOSITORY_URL: '$ECR_REPOSITORY_URL'"
-        echo "TASK_DEFINITION_ARN: '$TASK_DEFINITION_ARN'"
+        echo "ECR_REPOSITORY_NAME: '$ECR_REPOSITORY_NAME'"
+        echo "TASK_DEFINITION_FAMILY: '$TASK_DEFINITION_FAMILY'"
         
-        # Fallback for ECR repository URL if needed
-        if [ -z "$ECR_REPOSITORY_URL" ]; then
-          echo "⚠️  ECR_REPOSITORY_URL is empty, trying to get it from AWS directly..."
-          ECR_REPOSITORY_URL=$(aws ecr describe-repositories \
-            --repository-names chess-glicko-pipeline \
-            --query 'repositories[0].repositoryUri' \
-            --output text 2>/dev/null || echo "")
+        # Fallback for task definition family if needed
+        if [ -z "$TASK_DEFINITION_FAMILY" ]; then
+          echo "⚠️  TASK_DEFINITION_FAMILY is empty, using default: chess-glicko-task"
+          TASK_DEFINITION_FAMILY="chess-glicko-task"
         fi
         
-        # Fallback for task definition ARN if needed
-        if [ -z "$TASK_DEFINITION_ARN" ]; then
-          echo "⚠️  TASK_DEFINITION_ARN is empty, trying to get it from AWS directly..."
-          TASK_DEFINITION_ARN=$(aws ecs describe-task-definition \
-            --task-definition chess-glicko-task \
-            --query 'taskDefinition.taskDefinitionArn' \
-            --output text 2>/dev/null || echo "")
+        # Fallback for repository name if needed
+        if [ -z "$ECR_REPOSITORY_NAME" ]; then
+          echo "⚠️  ECR_REPOSITORY_NAME is empty, using default: chess-glicko-pipeline"
+          ECR_REPOSITORY_NAME="chess-glicko-pipeline"
         fi
         
-        # Get current task definition family
-        TASK_FAMILY=$(echo "$TASK_DEFINITION_ARN" | cut -d'/' -f2 | cut -d':' -f1)
-        echo "Task family: $TASK_FAMILY"
+        echo "Using task family: $TASK_DEFINITION_FAMILY"
+        echo "Using repository name: $ECR_REPOSITORY_NAME"
         
         # Get the task definition
         aws ecs describe-task-definition \
-          --task-definition $TASK_FAMILY \
+          --task-definition $TASK_DEFINITION_FAMILY \
           --query taskDefinition > task-def.json
         
-        # Update the image
-        REPO_NAME=$(echo "$ECR_REPOSITORY_URL" | cut -d'/' -f2)
-        NEW_IMAGE="${{ steps.login-ecr.outputs.registry }}/$REPO_NAME:latest"
+        # Build new image URI
+        NEW_IMAGE="${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY_NAME:latest"
         echo "New image: $NEW_IMAGE"
         
         # Create new task definition
