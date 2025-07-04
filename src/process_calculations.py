@@ -41,9 +41,6 @@ class CalculationProcessor:
             # Setup local temp directory
             os.makedirs(self.local_temp_dir, exist_ok=True)
             
-            # Load name-to-ID mapping from processed player data
-            await self._load_name_to_id_mapping(year, month)
-            
             # Determine which time controls to process based on year
             time_controls_to_process = ["standard"]
             if year >= 2012:
@@ -55,8 +52,15 @@ class CalculationProcessor:
             results = []
             for time_control in time_controls_to_process:
                 try:
+                    # Load name-to-ID mapping for this specific time control
+                    await self._load_name_to_id_mapping(time_control, year, month)
+                    
                     result = await self._process_time_control(time_control, year, month)
                     results.append((time_control, result))
+                    
+                    # Clear cache for next time control to avoid conflicts
+                    self.name_to_id_cache.clear()
+                    
                 except Exception as e:
                     logger.error(f"Error processing {time_control}: {str(e)}")
                     results.append((time_control, {"error": str(e)}))
@@ -71,13 +75,13 @@ class CalculationProcessor:
             logger.error(f"Error in calculation processing: {str(e)}", exc_info=True)
             raise
 
-    async def _load_name_to_id_mapping(self, year: int, month: int):
-        """Load name-to-ID mapping from processed player data"""
+    async def _load_name_to_id_mapping(self, time_control: str, year: int, month: int):
+        """Load name-to-ID mapping from processed player data for a specific time control"""
         month_str = f"{month:02d}"
-        s3_key = f"persistent/player_info/processed/{year}-{month_str}.txt"
+        s3_key = f"persistent/player_info/processed/{time_control}/{year}-{month_str}.txt"
         
         try:
-            logger.info("Loading name-to-ID mapping from processed player data...")
+            logger.info(f"Loading name-to-ID mapping from processed player data for {time_control}...")
             
             # Download processed player data
             response = await asyncio.get_event_loop().run_in_executor(
@@ -106,13 +110,13 @@ class CalculationProcessor:
                         logger.warning(f"Failed to parse player data line: {line[:100]}...")
                         continue
             
-            logger.info(f"Loaded {count} name-to-ID mappings")
+            logger.info(f"Loaded {count} name-to-ID mappings for {time_control}")
             
         except ClientError as e:
-            logger.error(f"Failed to load player data for name-to-ID mapping: {str(e)}")
+            logger.error(f"Failed to load player data for name-to-ID mapping ({time_control}): {str(e)}")
             raise
         except Exception as e:
-            logger.error(f"Error loading name-to-ID mapping: {str(e)}")
+            logger.error(f"Error loading name-to-ID mapping for {time_control}: {str(e)}")
             raise
 
     async def _process_time_control(self, time_control: str, year: int, month: int) -> Dict:
@@ -424,136 +428,6 @@ class CalculationProcessor:
             
         except Exception as e:
             logger.warning(f"Failed to upload processing completion marker: {str(e)}")
-
-    async def create_test_data(self, month_str: str, sample_size: int = 100):
-        """Create test data subset for isolated testing of later pipeline stages"""
-        try:
-            year, month = map(int, month_str.split("-"))
-            month_str_formatted = f"{month:02d}"
-            
-            logger.info(f"Creating test data for {month_str} with sample size {sample_size}")
-            
-            # Create test data directory structure
-            test_prefix = f"test_data/{month_str}/"
-            
-            # Sample player data
-            await self._create_test_player_data(year, month, sample_size, test_prefix)
-            
-            # Sample calculation data for each time control
-            time_controls = ["standard"]
-            if year >= 2012:
-                time_controls.extend(["rapid", "blitz"])
-            
-            for time_control in time_controls:
-                await self._create_test_calculation_data(year, month, time_control, sample_size, test_prefix)
-            
-            # Create test completion marker
-            await self._create_test_completion_marker(month_str, time_controls, sample_size)
-            
-            logger.info(f"Test data created successfully for {month_str}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error creating test data: {str(e)}")
-            return False
-
-    async def _create_test_player_data(self, year: int, month: int, sample_size: int, test_prefix: str):
-        """Create sample player data for testing"""
-        month_str = f"{month:02d}"
-        source_key = f"persistent/player_info/processed/{year}-{month_str}.txt"
-        test_key = f"{test_prefix}player_info/processed/{year}-{month_str}.txt"
-        
-        try:
-            # Download full player data
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.s3_client.get_object(Bucket=self.s3_bucket, Key=source_key)
-            )
-            
-            content = response['Body'].read().decode('utf-8')
-            lines = content.strip().split('\n')
-            
-            # Sample lines
-            sampled_lines = lines[:sample_size] if len(lines) >= sample_size else lines
-            
-            # Create local test file
-            local_file = os.path.join(self.local_temp_dir, f"test_player_data_{year}-{month_str}.txt")
-            async with aiofiles.open(local_file, "w") as f:
-                await f.write('\n'.join(sampled_lines))
-            
-            # Upload test data
-            await self._upload_to_s3_async(local_file, test_key)
-            
-            # Cleanup
-            os.remove(local_file)
-            
-            logger.info(f"Created test player data with {len(sampled_lines)} players")
-            
-        except Exception as e:
-            logger.error(f"Error creating test player data: {str(e)}")
-
-    async def _create_test_calculation_data(self, year: int, month: int, time_control: str, sample_size: int, test_prefix: str):
-        """Create sample calculation data for testing"""
-        month_str = f"{month:02d}"
-        source_prefix = f"persistent/calculations/{year}-{month_str}/{time_control}/"
-        test_prefix_calc = f"{test_prefix}calculations/{year}-{month_str}/{time_control}/"
-        
-        try:
-            # List calculation files
-            files = await self._list_calculation_files(time_control, year, month)
-            
-            if not files:
-                logger.info(f"No calculation files found for {time_control}")
-                return
-            
-            # Sample files
-            sampled_files = files[:sample_size] if len(files) >= sample_size else files
-            
-            # Copy sampled files
-            for file_key in sampled_files:
-                file_name = file_key.split('/')[-1]
-                test_file_key = f"{test_prefix_calc}{file_name}"
-                
-                # Copy file within S3
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.s3_client.copy_object(
-                        Bucket=self.s3_bucket,
-                        CopySource={'Bucket': self.s3_bucket, 'Key': file_key},
-                        Key=test_file_key
-                    )
-                )
-            
-            logger.info(f"Created test calculation data for {time_control} with {len(sampled_files)} files")
-            
-        except Exception as e:
-            logger.error(f"Error creating test calculation data for {time_control}: {str(e)}")
-
-    async def _create_test_completion_marker(self, month_str: str, time_controls: List[str], sample_size: int):
-        """Create test completion marker"""
-        try:
-            completion_data = {
-                "month": month_str,
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "test_data": True,
-                "sample_size": sample_size,
-                "time_controls": time_controls,
-                "note": "This is test data for isolated pipeline testing"
-            }
-            
-            local_file = os.path.join(self.local_temp_dir, f"test_completion_{month_str}.json")
-            async with aiofiles.open(local_file, "w") as f:
-                await f.write(json.dumps(completion_data, indent=2))
-            
-            test_key = f"test_data/{month_str}/test_completion.json"
-            await self._upload_to_s3_async(local_file, test_key)
-            
-            os.remove(local_file)
-            
-            logger.info(f"Created test completion marker for {month_str}")
-            
-        except Exception as e:
-            logger.error(f"Error creating test completion marker: {str(e)}")
 
 def main():
     parser = argparse.ArgumentParser(description="Process FIDE calculation data into compact format.")
