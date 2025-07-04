@@ -471,7 +471,7 @@ jobs:
         MISSING_DATA=""
         
         # Check if processed player data exists
-        if ! aws s3 ls "s3://$S3_BUCKET_NAME/persistent/player_info/processed/$TEST_MONTH.txt" >/dev/null 2>&1; then
+        if ! aws s3 ls "s3://$S3_BUCKET_NAME/persistent/player_info/processed/standard/$TEST_MONTH.txt" >/dev/null 2>&1; then
           MISSING_DATA="$MISSING_DATA\n- Player info processed data (persistent/player_info/processed/$TEST_MONTH.txt)"
         fi
         
