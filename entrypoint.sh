@@ -35,8 +35,8 @@ validate_post_scraping_data() {
     local missing_data=""
     
     # Check if processed player data exists
-    if ! aws s3 ls "s3://$S3_BUCKET/persistent/player_info/processed/$PROCESS_MONTH.txt" >/dev/null 2>&1; then
-        missing_data="$missing_data\n- Player info processed data (persistent/player_info/processed/$PROCESS_MONTH.txt)"
+    if ! aws s3 ls "s3://$S3_BUCKET/persistent/player_info/processed/standard/$PROCESS_MONTH.txt" >/dev/null 2>&1; then
+        missing_data="$missing_data\n- Player info processed data (persistent/player_info/processed/standard/$PROCESS_MONTH.txt)"
     fi
     
     # Check if active players data exists for at least standard time control
