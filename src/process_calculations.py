@@ -13,6 +13,7 @@ from pathlib import Path
 import gzip
 import tempfile
 import string
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -102,8 +103,8 @@ class CalculationProcessor:
                         player_name = player_data.get('name', '').strip()
                         
                         if player_id and player_name:
-                            # Normalize name for lookup (remove extra spaces, handle case, remove punctuation)
-                            normalized_name = ' '.join(player_name.split()).strip().lower().translate(str.maketrans('', '', string.punctuation))
+                            # Normalize name for lookup (remove parenthesis and content, extra spaces, case, punctuation)
+                            normalized_name = self._normalize_player_name(player_name)
                             self.name_to_id_cache[normalized_name] = player_id
                             count += 1
                             
@@ -119,6 +120,14 @@ class CalculationProcessor:
         except Exception as e:
             logger.error(f"Error loading name-to-ID mapping for {time_control}: {str(e)}")
             raise
+
+    def _normalize_player_name(self, name: str) -> str:
+        """Normalize player name: remove parenthesis and content, extra spaces, lowercase, remove punctuation."""
+        # Remove parenthesis and content inside
+        name_no_paren = re.sub(r'\([^)]*\)', '', name)
+        # Remove extra spaces, lowercase, remove punctuation
+        normalized = ' '.join(name_no_paren.split()).strip().lower().translate(str.maketrans('', '', string.punctuation))
+        return normalized
 
     async def _process_time_control(self, time_control: str, year: int, month: int) -> Dict:
         """Process all calculation files for a specific time control"""
@@ -340,7 +349,7 @@ class CalculationProcessor:
             return None
         
         # Normalize name for lookup
-        normalized_name = ' '.join(name.split()).strip().lower().translate(str.maketrans('', '', string.punctuation))
+        normalized_name = self._normalize_player_name(name)
         
         return self.name_to_id_cache.get(normalized_name)
 
