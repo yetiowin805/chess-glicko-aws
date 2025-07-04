@@ -48,6 +48,7 @@ class PlayerDataDownloader:
                     # Check if file already exists in S3
                     if self._check_s3_file_exists(s3_key):
                         logger.info(f"{time_control} file exists in S3.")
+                        downloaded_files.append(s3_key)
                         continue
                     else:
                         # Download from FIDE website
