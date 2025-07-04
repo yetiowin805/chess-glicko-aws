@@ -432,7 +432,11 @@ jobs:
         else
           echo "❌ Failed to start legacy test task"
           exit 1
-        fiName=isDefault,Values=true' --query 'Vpcs[0].VpcId' --output text)" \
+        fi
+
+        # Get network configuration
+        SUBNET_IDS=$(aws ec2 describe-subnets \
+          --filters "Name=vpc-id,Values=$(aws ec2 describe-vpcs --filters 'Name=isDefault,Values=true' --query 'Vpcs[0].VpcId' --output text)" \
           --query 'Subnets[0:3].SubnetId' \
           --output text | tr '\t' ',')
         
@@ -632,41 +636,3 @@ jobs:
           echo "❌ Failed to start post-scraping pipeline test"
           exit 1
         fi
-
-  # Keep the legacy test for backward compatibility
-  test-deployment:
-    needs: [deploy-infrastructure, build-and-deploy]
-    runs-on: ubuntu-latest
-    if: github.event.inputs.force_deploy == 'true' && github.event.inputs.test_type == 'none'
-    
-    steps:
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-
-    - name: Run Legacy Test Pipeline
-      env:
-        CLUSTER_NAME: ${{ needs.deploy-infrastructure.outputs.ecs_cluster_name }}
-        TASK_DEFINITION_FAMILY: ${{ needs.deploy-infrastructure.outputs.task_definition_family }}
-      run: |
-        echo "=== Running Legacy Test Pipeline ==="
-        echo "⚠️  This is the legacy test. Consider using test_type: 'full' or 'post_scraping' instead."
-        
-        # Fallback for cluster name if needed
-        if [ -z "$CLUSTER_NAME" ]; then
-          echo "⚠️  CLUSTER_NAME is empty, using default: chess-glicko-cluster"
-          CLUSTER_NAME="chess-glicko-cluster"
-        fi
-        
-        # Fallback for task definition family if needed
-        if [ -z "$TASK_DEFINITION_FAMILY" ]; then
-          echo "⚠️  TASK_DEFINITION_FAMILY is empty, using default: chess-glicko-task"
-          TASK_DEFINITION_FAMILY="chess-glicko-task"
-        fi
-        
-        # Get network configuration
-        SUBNET_IDS=$(aws ec2 describe-subnets \
-          --filters "Name=vpc-id,Values=$(aws ec2 describe-vpcs --filters '
