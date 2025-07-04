@@ -295,7 +295,7 @@ esac
 
 # Optional: Send notification (if SNS topic is configured)
 if [ -n "$SNS_TOPIC_ARN" ]; then
-    local message="Chess Rating Pipeline ($PIPELINE_MODE mode) completed successfully for $PROCESS_MONTH."
+    message="Chess Rating Pipeline ($PIPELINE_MODE mode) completed successfully for $PROCESS_MONTH."
     
     if [ "$PIPELINE_MODE" = "full" ]; then
         message="$message Downloaded player data, processed it, scraped/processed tournament data in parallel, aggregated unique player IDs by time control, scraped individual player calculation data, and processed calculations."

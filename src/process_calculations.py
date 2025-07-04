@@ -297,6 +297,8 @@ class CalculationProcessor:
                     # Only include opponent_name if we couldn't resolve ID
                     if opponent_id:
                         del game_record['opponent_name']
+                    else:
+                        logger.warning(f"Could not resolve opponent ID for {opponent_name}")
                     
                     processed_games.append(game_record)
             
@@ -574,17 +576,6 @@ def main():
         help="AWS region",
         default=os.environ.get("AWS_REGION", DEFAULT_AWS_REGION),
     )
-    parser.add_argument(
-        "--create_test_data",
-        action="store_true",
-        help="Create test data subset for isolated testing",
-    )
-    parser.add_argument(
-        "--test_sample_size",
-        type=int,
-        default=100,
-        help="Sample size for test data creation",
-    )
 
     args = parser.parse_args()
     
@@ -602,24 +593,13 @@ def main():
     )
     
     try:
-        if args.create_test_data:
-            # Create test data
-            success = asyncio.run(processor.create_test_data(args.month, args.test_sample_size))
-            if success:
-                logger.info(f"Test data creation completed successfully for {args.month}")
-                return 0
-            else:
-                logger.error("Test data creation failed")
-                return 1
+        success = asyncio.run(processor.process_calculations_for_month(args.month))
+        if success:
+            logger.info(f"Calculation processing completed successfully for {args.month}")
+            return 0
         else:
-            # Process calculations
-            success = asyncio.run(processor.process_calculations_for_month(args.month))
-            if success:
-                logger.info(f"Calculation processing completed successfully for {args.month}")
-                return 0
-            else:
-                logger.error("Calculation processing failed")
-                return 1
+            logger.error("Calculation processing failed")
+            return 1
                 
     except Exception as e:
         logger.error(f"Processing failed with error: {str(e)}", exc_info=True)
