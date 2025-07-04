@@ -12,6 +12,7 @@ from botocore.exceptions import ClientError
 from pathlib import Path
 import gzip
 import tempfile
+import string
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -101,8 +102,8 @@ class CalculationProcessor:
                         player_name = player_data.get('name', '').strip()
                         
                         if player_id and player_name:
-                            # Normalize name for lookup (remove extra spaces, handle case)
-                            normalized_name = ' '.join(player_name.split()).strip()
+                            # Normalize name for lookup (remove extra spaces, handle case, remove punctuation)
+                            normalized_name = ' '.join(player_name.split()).strip().lower().translate(str.maketrans('', '', string.punctuation))
                             self.name_to_id_cache[normalized_name] = player_id
                             count += 1
                             
@@ -339,7 +340,7 @@ class CalculationProcessor:
             return None
         
         # Normalize name for lookup
-        normalized_name = ' '.join(name.split()).strip()
+        normalized_name = ' '.join(name.split()).strip().lower().translate(str.maketrans('', '', string.punctuation))
         
         return self.name_to_id_cache.get(normalized_name)
 
