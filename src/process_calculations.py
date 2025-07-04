@@ -317,13 +317,11 @@ class CalculationProcessor:
         """Convert game result string to numeric score"""
         result = result.strip().lower()
         
-        if result in ['1', '1-0', 'w', 'win']:
+        if result in ['1', '1.0', '1.00']:
             return 1.0
-        elif result in ['0', '0-1', 'l', 'loss']:
+        elif result in ['0', '0.0', '0.00']:
             return 0.0
-        elif result in ['0.5', '1/2', '½', 'draw', 'd']:
-            return 0.5
-        elif result in ['1/2-1/2', '0.5-0.5']:
+        elif result in ['0.5', '0.50']:
             return 0.5
         else:
             logger.warning(f"Unknown result format: {result}")
