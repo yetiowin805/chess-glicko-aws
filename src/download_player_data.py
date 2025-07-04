@@ -32,45 +32,83 @@ class PlayerDataDownloader:
             
             # Setup local temp directory
             os.makedirs(self.local_temp_dir, exist_ok=True)
-            local_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}.txt")
-            s3_key = f"persistent/player_info/raw/{year}-{month:02d}.txt"
             
-            # Check if file already exists in S3
-            if self._check_s3_file_exists(s3_key):
-                logger.info(f"File exists in S3, downloading to local temp...")
-                self._download_from_s3(s3_key, local_file)
-                return local_file
+            # Determine if we need multiple rating lists (after 2012)
+            needs_multiple_lists = year > 2012 or (year == 2012 and month >= 9)
             
-            # Download from FIDE website
-            success = self._download_from_fide(year, month, local_file)
-            
-            if success:
-                # Upload to S3 for persistence
-                self._upload_to_s3(local_file, s3_key)
-                return local_file
+            if needs_multiple_lists:
+                # Download all three rating lists
+                downloaded_files = []
+                time_controls = ["standard", "rapid", "blitz"]
+                
+                for time_control in time_controls:
+                    local_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}.txt")
+                    s3_key = f"persistent/player_info/raw/{time_control}/{year}-{month:02d}.txt"
+                    
+                    # Check if file already exists in S3
+                    if self._check_s3_file_exists(s3_key):
+                        logger.info(f"{time_control} file exists in S3.")
+                        continue
+                    else:
+                        # Download from FIDE website
+                        success = self._download_from_fide(year, month, local_file, time_control)
+                        
+                        if success:
+                            # Upload to S3 for persistence
+                            self._upload_to_s3(local_file, s3_key)
+                            downloaded_files.append(s3_key)
+                        else:
+                            logger.warning(f"Failed to download {time_control} rating list")
+                
+                return downloaded_files if downloaded_files else None
             else:
-                return None
+                # Download only standard rating list (pre-2012 format)
+                local_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}.txt")
+                s3_key = f"persistent/player_info/raw/{year}-{month:02d}.txt"
+                
+                # Check if file already exists in S3
+                if self._check_s3_file_exists(s3_key):
+                    logger.info(f"File exists in S3.")
+                    return None
+                
+                # Download from FIDE website
+                success = self._download_from_fide(year, month, local_file)
+                
+                if success:
+                    # Upload to S3 for persistence
+                    self._upload_to_s3(local_file, s3_key)
+                    return [s3_key]
+                else:
+                    return None
                 
         except Exception as e:
             logger.error(f"Error downloading player data: {str(e)}")
             raise
     
-    def _download_from_fide(self, year, month, local_file):
+    def _download_from_fide(self, year, month, local_file, time_control=None):
         """Download player data from FIDE website"""
         month_str = self.month_mappings[month]
         year_str = str(year)[2:]
         
         # Determine ZIP file naming convention
-        if year > 2012 or (year == 2012 and month >= 9):
+        if time_control == "standard":
             zip_header = f"standard_{month_str}{year_str}"
+        elif time_control == "rapid":
+            zip_header = f"rapid_{month_str}{year_str}"
+        elif time_control == "blitz":
+            zip_header = f"blitz_{month_str}{year_str}"
         else:
+            # Pre-2012 format (no time control prefix)
             zip_header = f"{month_str}{year_str}"
         
         url = f"{self.base_url}{zip_header}frl.zip"
         zip_path = os.path.join(self.local_temp_dir, f"{zip_header}frl.zip")
         
         try:
-            logger.info(f"Downloading from {url}")
+            if time_control:
+                logger.info(f"Downloading {time_control} rating list from {url}")
+            else:
+                logger.info(f"Downloading rating list from {url}")
             response = requests.get(url, timeout=300)  # 5 minute timeout
             response.raise_for_status()
             
@@ -94,11 +132,17 @@ class PlayerDataDownloader:
             # Cleanup
             os.remove(zip_path)
             
-            logger.info(f"Successfully downloaded and extracted {local_file}")
+            if time_control:
+                logger.info(f"Successfully downloaded and extracted {time_control} rating list: {local_file}")
+            else:
+                logger.info(f"Successfully downloaded and extracted rating list: {local_file}")
             return True
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to download from {url}: {str(e)}")
+            if time_control:
+                logger.error(f"Failed to download {time_control} rating list from {url}: {str(e)}")
+            else:
+                logger.error(f"Failed to download rating list from {url}: {str(e)}")
             return False
         except zipfile.BadZipFile as e:
             logger.error(f"Failed to extract {zip_path}: {str(e)}")
@@ -106,7 +150,10 @@ class PlayerDataDownloader:
                 os.remove(zip_path)
             return False
         except Exception as e:
-            logger.error(f"Unexpected error during FIDE download: {str(e)}")
+            if time_control:
+                logger.error(f"Unexpected error during {time_control} FIDE download: {str(e)}")
+            else:
+                logger.error(f"Unexpected error during FIDE download: {str(e)}")
             return False
     
     def _check_s3_file_exists(self, s3_key):
@@ -134,7 +181,7 @@ class PlayerDataDownloader:
             logger.info(f"Uploaded {local_path} to S3 as {s3_key}")
         except ClientError as e:
             logger.error(f"Failed to upload to S3: {str(e)}")
-            # Don't raise - this is not critical for the pipeline
+            raise Exception(f"Failed to upload to S3: {str(e)}")
 
 def main():
     parser = argparse.ArgumentParser(description="Download FIDE player information.")
@@ -177,7 +224,12 @@ def main():
     result = downloader.download_player_data(args.month)
     
     if result:
-        logger.info(f"Player data download completed successfully: {result}")
+        if isinstance(result, list):
+            logger.info(f"Player data download completed successfully. Downloaded {len(result)} files:")
+            for file_path in result:
+                logger.info(f"  - {file_path}")
+        else:
+            logger.info(f"Player data download completed successfully: {result}")
         return 0
     else:
         logger.error("Player data download failed")

@@ -27,43 +27,89 @@ class FIDEDataProcessor:
             # Setup local temp directory
             os.makedirs(self.local_temp_dir, exist_ok=True)
             
-            # Define S3 keys
-            raw_s3_key = f"persistent/player_info/raw/{year}-{month:02d}.txt"
-            processed_s3_key = f"persistent/player_info/processed/{year}-{month:02d}.txt"
+            # Determine if we need multiple rating lists (after 2012)
+            needs_multiple_lists = year > 2012 or (year == 2012 and month >= 9)
             
-            # Check if processed file already exists in S3
-            if self._check_s3_file_exists(processed_s3_key):
-                logger.info(f"Processed file already exists in S3: {processed_s3_key}")
-                return True
-            
-            # Download raw file from S3
-            local_raw_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}_raw.txt")
-            if not self._download_from_s3(raw_s3_key, local_raw_file):
-                logger.error(f"Failed to download raw file from S3: {raw_s3_key}")
-                return False
-            
-            # Process the file
-            local_processed_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}_processed.txt")
-            success = self._process_file(local_raw_file, local_processed_file, year, month)
-            
-            if success:
-                # Upload processed file to S3
-                self._upload_to_s3(local_processed_file, processed_s3_key)
+            if needs_multiple_lists:
+                # Process all three rating lists
+                time_controls = ["standard", "rapid", "blitz"]
+                processed_files = []
                 
-                # Cleanup local files
-                self._cleanup_local_files([local_raw_file, local_processed_file])
+                for time_control in time_controls:
+                    # Define S3 keys
+                    raw_s3_key = f"persistent/player_info/raw/{time_control}/{year}-{month:02d}.txt"
+                    processed_s3_key = f"persistent/player_info/processed/{time_control}/{year}-{month:02d}.txt"
+                    
+                    # Check if processed file already exists in S3
+                    if self._check_s3_file_exists(processed_s3_key):
+                        logger.info(f"Processed {time_control} file already exists in S3: {processed_s3_key}")
+                        processed_files.append(processed_s3_key)
+                        continue
+                    
+                    # Download raw file from S3
+                    local_raw_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}_{time_control}_raw.txt")
+                    if not self._download_from_s3(raw_s3_key, local_raw_file):
+                        logger.error(f"Failed to download {time_control} raw file from S3: {raw_s3_key}")
+                        continue
+                    
+                    # Process the file
+                    local_processed_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}_{time_control}_processed.txt")
+                    success = self._process_file(local_raw_file, local_processed_file, year, month, time_control)
+                    
+                    if success:
+                        # Upload processed file to S3
+                        self._upload_to_s3(local_processed_file, processed_s3_key)
+                        
+                        # Cleanup local files
+                        self._cleanup_local_files([local_raw_file, local_processed_file])
+                        
+                        logger.info(f"Successfully processed and uploaded {processed_s3_key}")
+                        processed_files.append(processed_s3_key)
+                    else:
+                        logger.error(f"Processing failed for {time_control}")
+                        self._cleanup_local_files([local_raw_file, local_processed_file])
                 
-                logger.info(f"Successfully processed and uploaded {processed_s3_key}")
-                return True
+                return len(processed_files) > 0
             else:
-                logger.error("Processing failed")
-                return False
+                # Process only standard rating list (pre-2012 format)
+                # Define S3 keys
+                raw_s3_key = f"persistent/player_info/raw/standard/{year}-{month:02d}.txt"
+                processed_s3_key = f"persistent/player_info/processed/standard/{year}-{month:02d}.txt"
+                
+                # Check if processed file already exists in S3
+                if self._check_s3_file_exists(processed_s3_key):
+                    logger.info(f"Processed file already exists in S3: {processed_s3_key}")
+                    return True
+                
+                # Download raw file from S3
+                local_raw_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}_raw.txt")
+                if not self._download_from_s3(raw_s3_key, local_raw_file):
+                    logger.error(f"Failed to download raw file from S3: {raw_s3_key}")
+                    return False
+                
+                # Process the file
+                local_processed_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}_processed.txt")
+                success = self._process_file(local_raw_file, local_processed_file, year, month)
+                
+                if success:
+                    # Upload processed file to S3
+                    self._upload_to_s3(local_processed_file, processed_s3_key)
+                    
+                    # Cleanup local files
+                    self._cleanup_local_files([local_raw_file, local_processed_file])
+                    
+                    logger.info(f"Successfully processed and uploaded {processed_s3_key}")
+                    return True
+                else:
+                    logger.error("Processing failed")
+                    self._cleanup_local_files([local_raw_file, local_processed_file])
+                    return False
                 
         except Exception as e:
             logger.error(f"Error processing player data: {str(e)}")
             raise
     
-    def _process_file(self, input_filename, output_filename, year, month):
+    def _process_file(self, input_filename, output_filename, year, month, time_control=None):
         """Process the raw FIDE data file and convert to JSON format"""
         try:
             lengths, keys = self._get_format_config(year, month)
@@ -84,13 +130,18 @@ class FIDEDataProcessor:
                     try:
                         parts = self._process_line(line, lengths)
                         json_object = {key: value for key, value in zip(keys, parts)}
+                        
+                        # Add time_control field for newer periods
+                        if time_control:
+                            json_object["time_control"] = time_control
+                        
                         output_file.write(f"{json.dumps(json_object)}\n")
                         line_count += 1
                     except Exception as e:
                         logger.warning(f"Failed to process line {line_count + 1}: {str(e)}")
                         continue
                 
-                logger.info(f"Processed {line_count} records")
+                logger.info(f"Processed {line_count} records for {time_control if time_control else 'standard'} rating list")
                 return True
                 
         except Exception as e:
