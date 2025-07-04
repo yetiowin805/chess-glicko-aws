@@ -61,7 +61,7 @@ class CalculationProcessor:
                     results.append((time_control, result))
                     
                     # Clear cache for next time control to avoid conflicts
-                    self.name_to_id_cache.clear()
+                    # self.name_to_id_cache.clear()
                     
                 except Exception as e:
                     logger.error(f"Error processing {time_control}: {str(e)}")
@@ -287,6 +287,7 @@ class CalculationProcessor:
                     # Convert result to numeric score
                     score = self._convert_result_to_score(result)
                     if score is None:
+                        logger.warning(f"Invalid result: {result}")
                         continue  # Skip invalid results
                     
                     # Try to get opponent ID from name
@@ -297,24 +298,33 @@ class CalculationProcessor:
                         opponent_rating_int = int(opponent_rating) if opponent_rating else None
                     except (ValueError, TypeError):
                         opponent_rating_int = None
-                    
-                    # Create compact game record
-                    game_record = {
-                        'tournament_id': tournament_id,
-                        'opponent_id': opponent_id,
-                        'opponent_name': opponent_name,
-                        'opponent_rating': opponent_rating_int,
-                        'result': score,
-                        'player_unrated': is_unrated
-                    }
-                    
-                    # Only include opponent_name if we couldn't resolve ID
-                    if opponent_id:
-                        del game_record['opponent_name']
-                    else:
+                        
+                    if not opponent_id:
+                        logger.warning(f"Could not resolve opponent ID for {opponent_name}; {tournament_id}, {player_id}. Downloading tournament data...")
+                        tournament_file = await self._download_player_data(f"persistent/tournament_data/processed/{time_control}/{year}-{month_str}/{tournament_id}.txt")
+                        for line in tournament_file.strip().split('\n'):
+                            if line.strip():
+                                try:
+                                    player_data = json.loads(line.strip())
+                                    if player_data.get('name', '').strip() == opponent_name:
+                                        opponent_id = player_data.get('id')
+                                        break
+                                except json.JSONDecodeError:
+                                    continue
+                        
+                    if not opponent_id:
                         logger.warning(f"Could not resolve opponent ID for {opponent_name}; {tournament_id}, {player_id}")
-                    
-                    processed_games.append(game_record)
+                    else:
+                        # Create compact game record
+                        game_record = {
+                            'tournament_id': tournament_id,
+                            'opponent_id': opponent_id,
+                            'opponent_rating': opponent_rating_int,
+                            'result': score,
+                            'player_unrated': is_unrated
+                        }
+                        
+                        processed_games.append(game_record)
             
             if not processed_games:
                 return None
