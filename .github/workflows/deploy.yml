@@ -16,6 +16,19 @@ on:
         description: 'Force deployment even if no changes'
         required: false
         default: 'false'
+      test_type:
+        description: 'Type of test to run'
+        required: false
+        default: 'none'
+        type: choice
+        options:
+        - 'none'
+        - 'full'
+        - 'post_scraping'
+      test_month:
+        description: 'Month to test (YYYY-MM format, defaults to previous month)'
+        required: false
+        default: ''
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
@@ -323,10 +336,10 @@ jobs:
         
         echo "✅ Registered new task definition: $NEW_TASK_DEF"
 
-  test-deployment:
+  test-full-pipeline:
     needs: [deploy-infrastructure, build-and-deploy]
     runs-on: ubuntu-latest
-    if: github.event.inputs.force_deploy == 'true' || github.event_name == 'workflow_dispatch'
+    if: github.event.inputs.test_type == 'full'
     
     steps:
     - name: Configure AWS credentials
@@ -336,14 +349,16 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
 
-    - name: Run Test Pipeline
+    - name: Run Full Pipeline Test
       env:
         CLUSTER_NAME: ${{ needs.deploy-infrastructure.outputs.ecs_cluster_name }}
         TASK_DEFINITION_FAMILY: ${{ needs.deploy-infrastructure.outputs.task_definition_family }}
+        S3_BUCKET_NAME: ${{ needs.deploy-infrastructure.outputs.s3_bucket_name }}
       run: |
-        echo "=== Debug Test Pipeline Variables ==="
+        echo "=== Running Full Pipeline Test (All Steps) ==="
         echo "CLUSTER_NAME: '$CLUSTER_NAME'"
         echo "TASK_DEFINITION_FAMILY: '$TASK_DEFINITION_FAMILY'"
+        echo "S3_BUCKET_NAME: '$S3_BUCKET_NAME'"
         
         # Fallback for cluster name if needed
         if [ -z "$CLUSTER_NAME" ]; then
@@ -357,39 +372,42 @@ jobs:
           TASK_DEFINITION_FAMILY="chess-glicko-task"
         fi
         
-        echo "Using cluster: $CLUSTER_NAME"
-        echo "Using task family: $TASK_DEFINITION_FAMILY"
+        # Determine test month
+        if [ -n "${{ github.event.inputs.test_month }}" ]; then
+          TEST_MONTH="${{ github.event.inputs.test_month }}"
+        else
+          TEST_MONTH=$(date -d "$(date +'%Y-%m-01') -1 month" +'%Y-%m')
+        fi
         
-        # Get subnets from default VPC (more reliable than filtering by default-for-az)
+        echo "Testing full pipeline with month: $TEST_MONTH"
+        
+        # Get network configuration
         SUBNET_IDS=$(aws ec2 describe-subnets \
           --filters "Name=vpc-id,Values=$(aws ec2 describe-vpcs --filters 'Name=isDefault,Values=true' --query 'Vpcs[0].VpcId' --output text)" \
           --query 'Subnets[0:3].SubnetId' \
           --output text | tr '\t' ',')
         
-        echo "Using subnets: $SUBNET_IDS"
-        
-        # Get security group ID for ECS tasks
         SG_ID=$(aws ec2 describe-security-groups \
           --filters "Name=group-name,Values=chess-glicko-ecs-tasks" \
           --query 'SecurityGroups[0].GroupId' \
           --output text 2>/dev/null || echo "")
         
         if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
-          echo "⚠️  Could not find chess-glicko-ecs-tasks security group, getting default"
           SG_ID=$(aws ec2 describe-security-groups \
             --filters "Name=group-name,Values=default" \
             --query 'SecurityGroups[0].GroupId' \
             --output text)
         fi
         
+        echo "Using subnets: $SUBNET_IDS"
         echo "Using security group: $SG_ID"
         
         # Calculate test month (previous month)
         TEST_MONTH=$(date -d "$(date +'%Y-%m-01') -1 month" +'%Y-%m')
         echo "Testing with month: $TEST_MONTH"
         
-        # Run test task - use TASK_DEFINITION_FAMILY directly (no extraction needed)
-        echo "Running ECS task..."
+        # Run legacy test task
+        echo "Running legacy ECS task..."
         TASK_ARN=$(aws ecs run-task \
           --cluster "$CLUSTER_NAME" \
           --task-definition "$TASK_DEFINITION_FAMILY" \
@@ -400,7 +418,7 @@ jobs:
           --output text)
         
         if [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
-          echo "✅ Test task started: $TASK_ARN"
+          echo "✅ Legacy test task started: $TASK_ARN"
           echo "Monitor with: aws ecs describe-tasks --cluster $CLUSTER_NAME --tasks $TASK_ARN"
           
           # Wait a moment and check task status
@@ -412,6 +430,243 @@ jobs:
             --output text)
           echo "Task status after 10 seconds: $TASK_STATUS"
         else
-          echo "❌ Failed to start task"
+          echo "❌ Failed to start legacy test task"
+          exit 1
+        fiName=isDefault,Values=true' --query 'Vpcs[0].VpcId' --output text)" \
+          --query 'Subnets[0:3].SubnetId' \
+          --output text | tr '\t' ',')
+        
+        SG_ID=$(aws ec2 describe-security-groups \
+          --filters "Name=group-name,Values=chess-glicko-ecs-tasks" \
+          --query 'SecurityGroups[0].GroupId' \
+          --output text 2>/dev/null || echo "")
+        
+        if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=default" \
+            --query 'SecurityGroups[0].GroupId' \
+            --output text)
+        fi
+        
+        echo "Using subnets: $SUBNET_IDS"
+        echo "Using security group: $SG_ID"
+        
+        # Run full pipeline task
+        echo "Starting full pipeline task..."
+        TASK_ARN=$(aws ecs run-task \
+          --cluster "$CLUSTER_NAME" \
+          --task-definition "$TASK_DEFINITION_FAMILY" \
+          --launch-type FARGATE \
+          --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],assignPublicIp=ENABLED,securityGroups=[$SG_ID]}" \
+          --overrides "{\"containerOverrides\":[{\"name\":\"chess-glicko\",\"environment\":[{\"name\":\"PROCESS_MONTH\",\"value\":\"$TEST_MONTH\"},{\"name\":\"PIPELINE_MODE\",\"value\":\"full\"},{\"name\":\"S3_BUCKET\",\"value\":\"$S3_BUCKET_NAME\"}]}]}" \
+          --query 'tasks[0].taskArn' \
+          --output text)
+        
+        if [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
+          echo "✅ Full pipeline test started: $TASK_ARN"
+          echo "This will run all pipeline steps including data downloading and scraping."
+          echo "Monitor with: aws ecs describe-tasks --cluster $CLUSTER_NAME --tasks $TASK_ARN"
+          
+          # Wait a moment and check task status
+          sleep 15
+          TASK_STATUS=$(aws ecs describe-tasks \
+            --cluster "$CLUSTER_NAME" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].lastStatus' \
+            --output text)
+          echo "Task status after 15 seconds: $TASK_STATUS"
+          
+          echo "⚠️  Note: Full pipeline test may take 15-20 minutes to complete"
+          echo "Check CloudWatch logs for detailed progress: /ecs/chess-glicko"
+        else
+          echo "❌ Failed to start full pipeline test"
           exit 1
         fi
+
+  test-post-scraping:
+    needs: [deploy-infrastructure, build-and-deploy]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_type == 'post_scraping'
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Validate Required Data Exists
+      env:
+        S3_BUCKET_NAME: ${{ needs.deploy-infrastructure.outputs.s3_bucket_name }}
+      run: |
+        echo "=== Validating Required Data for Post-Scraping Test ==="
+        
+        # Determine test month
+        if [ -n "${{ github.event.inputs.test_month }}" ]; then
+          TEST_MONTH="${{ github.event.inputs.test_month }}"
+        else
+          TEST_MONTH=$(date -d "$(date +'%Y-%m-01') -1 month" +'%Y-%m')
+        fi
+        
+        echo "Checking data for month: $TEST_MONTH"
+        echo "S3 bucket: $S3_BUCKET_NAME"
+        
+        # Check if required data exists
+        MISSING_DATA=""
+        
+        # Check if processed player data exists
+        if ! aws s3 ls "s3://$S3_BUCKET_NAME/persistent/player_info/processed/$TEST_MONTH.txt" >/dev/null 2>&1; then
+          MISSING_DATA="$MISSING_DATA\n- Player info processed data (persistent/player_info/processed/$TEST_MONTH.txt)"
+        fi
+        
+        # Check if active players data exists for at least standard time control
+        if ! aws s3 ls "s3://$S3_BUCKET_NAME/persistent/active_players/${TEST_MONTH}_standard.txt" >/dev/null 2>&1; then
+          MISSING_DATA="$MISSING_DATA\n- Active players data (persistent/active_players/${TEST_MONTH}_standard.txt)"
+        fi
+        
+        # Check if calculation data exists
+        CALC_COUNT=$(aws s3 ls "s3://$S3_BUCKET_NAME/persistent/calculations/$TEST_MONTH/" --recursive | wc -l)
+        if [ "$CALC_COUNT" -eq 0 ]; then
+          MISSING_DATA="$MISSING_DATA\n- Calculation data (persistent/calculations/$TEST_MONTH/)"
+        fi
+        
+        # Export for next step
+        echo "TEST_MONTH=$TEST_MONTH" >> $GITHUB_ENV
+        
+        if [ -n "$MISSING_DATA" ]; then
+          echo "❌ ERROR: Required data is missing for post-scraping test:"
+          echo -e "$MISSING_DATA"
+          echo ""
+          echo "The post-scraping test requires that the following pipeline steps have been completed:"
+          echo "1. Download player data"
+          echo "2. Process player data"
+          echo "3. Scrape and process tournament data"
+          echo "4. Aggregate player IDs"
+          echo "5. Scrape player calculations"
+          echo ""
+          echo "Please run the full pipeline first, or use test_type: 'full' to test all steps."
+          exit 1
+        else
+          echo "✅ All required data found for post-scraping test"
+          echo "Found calculation files: $CALC_COUNT"
+        fi
+
+    - name: Run Post-Scraping Pipeline Test
+      env:
+        CLUSTER_NAME: ${{ needs.deploy-infrastructure.outputs.ecs_cluster_name }}
+        TASK_DEFINITION_FAMILY: ${{ needs.deploy-infrastructure.outputs.task_definition_family }}
+        S3_BUCKET_NAME: ${{ needs.deploy-infrastructure.outputs.s3_bucket_name }}
+      run: |
+        echo "=== Running Post-Scraping Pipeline Test ==="
+        echo "CLUSTER_NAME: '$CLUSTER_NAME'"
+        echo "TASK_DEFINITION_FAMILY: '$TASK_DEFINITION_FAMILY'"
+        echo "S3_BUCKET_NAME: '$S3_BUCKET_NAME'"
+        echo "TEST_MONTH: '$TEST_MONTH'"
+        
+        # Fallback for cluster name if needed
+        if [ -z "$CLUSTER_NAME" ]; then
+          echo "⚠️  CLUSTER_NAME is empty, using default: chess-glicko-cluster"
+          CLUSTER_NAME="chess-glicko-cluster"
+        fi
+        
+        # Fallback for task definition family if needed
+        if [ -z "$TASK_DEFINITION_FAMILY" ]; then
+          echo "⚠️  TASK_DEFINITION_FAMILY is empty, using default: chess-glicko-task"
+          TASK_DEFINITION_FAMILY="chess-glicko-task"
+        fi
+        
+        # Get network configuration
+        SUBNET_IDS=$(aws ec2 describe-subnets \
+          --filters "Name=vpc-id,Values=$(aws ec2 describe-vpcs --filters 'Name=isDefault,Values=true' --query 'Vpcs[0].VpcId' --output text)" \
+          --query 'Subnets[0:3].SubnetId' \
+          --output text | tr '\t' ',')
+        
+        SG_ID=$(aws ec2 describe-security-groups \
+          --filters "Name=group-name,Values=chess-glicko-ecs-tasks" \
+          --query 'SecurityGroups[0].GroupId' \
+          --output text 2>/dev/null || echo "")
+        
+        if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=default" \
+            --query 'SecurityGroups[0].GroupId' \
+            --output text)
+        fi
+        
+        echo "Using subnets: $SUBNET_IDS"
+        echo "Using security group: $SG_ID"
+        
+        # Run post-scraping pipeline task
+        echo "Starting post-scraping pipeline task..."
+        TASK_ARN=$(aws ecs run-task \
+          --cluster "$CLUSTER_NAME" \
+          --task-definition "$TASK_DEFINITION_FAMILY" \
+          --launch-type FARGATE \
+          --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],assignPublicIp=ENABLED,securityGroups=[$SG_ID]}" \
+          --overrides "{\"containerOverrides\":[{\"name\":\"chess-glicko\",\"environment\":[{\"name\":\"PROCESS_MONTH\",\"value\":\"$TEST_MONTH\"},{\"name\":\"PIPELINE_MODE\",\"value\":\"post_scraping\"},{\"name\":\"S3_BUCKET\",\"value\":\"$S3_BUCKET_NAME\"}]}]}" \
+          --query 'tasks[0].taskArn' \
+          --output text)
+        
+        if [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
+          echo "✅ Post-scraping pipeline test started: $TASK_ARN"
+          echo "This will run only the post-scraping steps:"
+          echo "- Process calculation data"
+          echo "- Calculate ratings"
+          echo "- Upload results"
+          echo ""
+          echo "Monitor with: aws ecs describe-tasks --cluster $CLUSTER_NAME --tasks $TASK_ARN"
+          
+          # Wait a moment and check task status
+          sleep 15
+          TASK_STATUS=$(aws ecs describe-tasks \
+            --cluster "$CLUSTER_NAME" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].lastStatus' \
+            --output text)
+          echo "Task status after 15 seconds: $TASK_STATUS"
+          
+          echo "⚠️  Note: Post-scraping test should complete in 2-5 minutes"
+          echo "Check CloudWatch logs for detailed progress: /ecs/chess-glicko"
+        else
+          echo "❌ Failed to start post-scraping pipeline test"
+          exit 1
+        fi
+
+  # Keep the legacy test for backward compatibility
+  test-deployment:
+    needs: [deploy-infrastructure, build-and-deploy]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.force_deploy == 'true' && github.event.inputs.test_type == 'none'
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Run Legacy Test Pipeline
+      env:
+        CLUSTER_NAME: ${{ needs.deploy-infrastructure.outputs.ecs_cluster_name }}
+        TASK_DEFINITION_FAMILY: ${{ needs.deploy-infrastructure.outputs.task_definition_family }}
+      run: |
+        echo "=== Running Legacy Test Pipeline ==="
+        echo "⚠️  This is the legacy test. Consider using test_type: 'full' or 'post_scraping' instead."
+        
+        # Fallback for cluster name if needed
+        if [ -z "$CLUSTER_NAME" ]; then
+          echo "⚠️  CLUSTER_NAME is empty, using default: chess-glicko-cluster"
+          CLUSTER_NAME="chess-glicko-cluster"
+        fi
+        
+        # Fallback for task definition family if needed
+        if [ -z "$TASK_DEFINITION_FAMILY" ]; then
+          echo "⚠️  TASK_DEFINITION_FAMILY is empty, using default: chess-glicko-task"
+          TASK_DEFINITION_FAMILY="chess-glicko-task"
+        fi
+        
+        # Get network configuration
+        SUBNET_IDS=$(aws ec2 describe-subnets \
+          --filters "Name=vpc-id,Values=$(aws ec2 describe-vpcs --filters '
