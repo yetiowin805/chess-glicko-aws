@@ -131,10 +131,6 @@ class FIDEDataProcessor:
                         parts = self._process_line(line, lengths)
                         json_object = {key: value for key, value in zip(keys, parts)}
                         
-                        # Add time_control field for newer periods
-                        if time_control:
-                            json_object["time_control"] = time_control
-                        
                         output_file.write(f"{json.dumps(json_object)}\n")
                         line_count += 1
                     except Exception as e:
