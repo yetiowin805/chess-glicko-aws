@@ -406,55 +406,6 @@ jobs:
         TEST_MONTH=$(date -d "$(date +'%Y-%m-01') -1 month" +'%Y-%m')
         echo "Testing with month: $TEST_MONTH"
         
-        # Run legacy test task
-        echo "Running legacy ECS task..."
-        TASK_ARN=$(aws ecs run-task \
-          --cluster "$CLUSTER_NAME" \
-          --task-definition "$TASK_DEFINITION_FAMILY" \
-          --launch-type FARGATE \
-          --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],assignPublicIp=ENABLED,securityGroups=[$SG_ID]}" \
-          --overrides "{\"containerOverrides\":[{\"name\":\"chess-glicko\",\"environment\":[{\"name\":\"PROCESS_MONTH\",\"value\":\"$TEST_MONTH\"}]}]}" \
-          --query 'tasks[0].taskArn' \
-          --output text)
-        
-        if [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
-          echo "✅ Legacy test task started: $TASK_ARN"
-          echo "Monitor with: aws ecs describe-tasks --cluster $CLUSTER_NAME --tasks $TASK_ARN"
-          
-          # Wait a moment and check task status
-          sleep 10
-          TASK_STATUS=$(aws ecs describe-tasks \
-            --cluster "$CLUSTER_NAME" \
-            --tasks "$TASK_ARN" \
-            --query 'tasks[0].lastStatus' \
-            --output text)
-          echo "Task status after 10 seconds: $TASK_STATUS"
-        else
-          echo "❌ Failed to start legacy test task"
-          exit 1
-        fi
-
-        # Get network configuration
-        SUBNET_IDS=$(aws ec2 describe-subnets \
-          --filters "Name=vpc-id,Values=$(aws ec2 describe-vpcs --filters 'Name=isDefault,Values=true' --query 'Vpcs[0].VpcId' --output text)" \
-          --query 'Subnets[0:3].SubnetId' \
-          --output text | tr '\t' ',')
-        
-        SG_ID=$(aws ec2 describe-security-groups \
-          --filters "Name=group-name,Values=chess-glicko-ecs-tasks" \
-          --query 'SecurityGroups[0].GroupId' \
-          --output text 2>/dev/null || echo "")
-        
-        if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
-          SG_ID=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=default" \
-            --query 'SecurityGroups[0].GroupId' \
-            --output text)
-        fi
-        
-        echo "Using subnets: $SUBNET_IDS"
-        echo "Using security group: $SG_ID"
-        
         # Run full pipeline task
         echo "Starting full pipeline task..."
         TASK_ARN=$(aws ecs run-task \
