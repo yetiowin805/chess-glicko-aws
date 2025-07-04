@@ -298,7 +298,7 @@ class CalculationProcessor:
                     if opponent_id:
                         del game_record['opponent_name']
                     else:
-                        logger.warning(f"Could not resolve opponent ID for {opponent_name}")
+                        logger.warning(f"Could not resolve opponent ID for {opponent_name}; {tournament_id}, {player_id}")
                     
                     processed_games.append(game_record)
             
