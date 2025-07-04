@@ -240,7 +240,7 @@ class CalculationProcessor:
                 player_id = file_key.split('/')[-1].replace('.json', '')
                 
                 # Process the calculation data
-                processed_calc = self._process_single_calculation(result, player_id, time_control)
+                processed_calc = await self._process_single_calculation(result, player_id, time_control, year, month)
                 
                 if processed_calc:
                     processed_data.append(processed_calc)
@@ -266,13 +266,14 @@ class CalculationProcessor:
             logger.warning(f"Error downloading {s3_key}: {str(e)}")
             return None
 
-    def _process_single_calculation(self, calculation_data: Dict, player_id: str, time_control: str) -> Optional[Dict]:
+    async def _process_single_calculation(self, calculation_data: Dict, player_id: str, time_control: str, year: int, month: int) -> Optional[Dict]:
         """Process a single player's calculation data into compact format"""
         try:
             if not calculation_data.get('tournaments'):
                 return None
             
             processed_games = []
+            month_str = f"{month:02d}"
             
             for tournament in calculation_data['tournaments']:
                 tournament_id = tournament.get('tournament_id', '')
@@ -301,16 +302,17 @@ class CalculationProcessor:
                         
                     if not opponent_id:
                         logger.warning(f"Could not resolve opponent ID for {opponent_name}; {tournament_id}, {player_id}. Downloading tournament data...")
-                        tournament_file = self._download_calculation_file(f"persistent/tournament_data/processed/{time_control}/{year}-{month_str}/{tournament_id}.txt")
-                        for line in tournament_file.strip().split('\n'):
-                            if line.strip():
-                                try:
-                                    player_data = json.loads(line.strip())
-                                    if player_data.get('name', '').strip() == opponent_name:
-                                        opponent_id = player_data.get('id')
-                                        break
-                                except json.JSONDecodeError:
-                                    continue
+                        tournament_file = await self._download_calculation_file(f"persistent/tournament_data/processed/{time_control}/{year}-{month_str}/{tournament_id}.txt")
+                        if tournament_file:
+                            for line in tournament_file.strip().split('\n'):
+                                if line.strip():
+                                    try:
+                                        player_data = json.loads(line.strip())
+                                        if player_data.get('name', '').strip() == opponent_name:
+                                            opponent_id = player_data.get('id')
+                                            break
+                                    except json.JSONDecodeError:
+                                        continue
                         
                     if not opponent_id:
                         logger.warning(f"Could not resolve opponent ID for {opponent_name}; {tournament_id}, {player_id}")
