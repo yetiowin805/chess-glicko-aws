@@ -301,7 +301,7 @@ class CalculationProcessor:
                         
                     if not opponent_id:
                         logger.warning(f"Could not resolve opponent ID for {opponent_name}; {tournament_id}, {player_id}. Downloading tournament data...")
-                        tournament_file = await self._download_player_data(f"persistent/tournament_data/processed/{time_control}/{year}-{month_str}/{tournament_id}.txt")
+                        tournament_file = self._download_calculation_file(f"persistent/tournament_data/processed/{time_control}/{year}-{month_str}/{tournament_id}.txt")
                         for line in tournament_file.strip().split('\n'):
                             if line.strip():
                                 try:
