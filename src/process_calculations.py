@@ -470,6 +470,7 @@ class CalculationProcessor:
 
             
             logger.warning(f"No match found for '{opponent_name}' in tournament {tournament_id}")
+            logger.warning(f"Normalized name: {normalized_name}")
             return None
             
         except Exception as e:

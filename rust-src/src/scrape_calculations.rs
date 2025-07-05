@@ -13,6 +13,8 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use tokio::fs;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -51,6 +53,12 @@ struct Tournament {
 #[derive(Debug, Serialize, Deserialize)]
 struct CalculationData {
     tournaments: Vec<Tournament>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PlayerCalculationRecord {
+    player_id: String,
+    calculation_data: CalculationData,
 }
 
 struct PlayerCalculationScraper {
@@ -164,6 +172,16 @@ impl PlayerCalculationScraper {
 
         info!("Processing {} players for {}", player_ids.len(), time_control);
 
+        // Create JSONL file for this time control
+        let jsonl_file_path = format!("{}/calculations_{}-{:02}_{}.jsonl", 
+                                     self.local_temp_dir, year, month, time_control);
+        let mut jsonl_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&jsonl_file_path)
+            .await?;
+
         let batch_size = 80; // Larger batches for better performance
         let mut total_processed = 0;
         let mut total_successful = 0;
@@ -172,29 +190,66 @@ impl PlayerCalculationScraper {
             let batch_num = batch_num + 1;
             info!("{}: Processing batch {} ({} players)", time_control, batch_num, chunk.len());
 
-            let results: Vec<bool> = stream::iter(chunk)
+            let results: Vec<Option<PlayerCalculationRecord>> = stream::iter(chunk)
                 .map(|player_id| self.process_single_player(player_id, time_control, year, month))
                 .buffer_unordered(40) // High concurrency within batch
-                .collect::<Vec<Result<bool>>>()
+                .collect::<Vec<Result<Option<PlayerCalculationRecord>>>>()
                 .await
                 .into_iter()
-                .map(|r| r.unwrap_or(false))
+                .map(|r| r.unwrap_or(None))
                 .collect();
 
-            let batch_successful = results.iter().filter(|&&r| r).count();
-            total_processed += results.len();
-            total_successful += batch_successful;
+            let mut batch_successful = 0;
+            for result in results {
+                total_processed += 1;
+                if let Some(record) = result {
+                    // Write to JSONL file
+                    let json_line = serde_json::to_string(&record)?;
+                    jsonl_file.write_all(json_line.as_bytes()).await?;
+                    jsonl_file.write_all(b"\n").await?;
+                    batch_successful += 1;
+                    total_successful += 1;
+                }
+            }
 
             info!("{}: Batch {} - {}/{} successful, Total: {}/{}", 
-                  time_control, batch_num, batch_successful, results.len(), 
+                  time_control, batch_num, batch_successful, chunk.len(), 
                   total_successful, total_processed);
 
             // Minimal pause to be respectful
             sleep(Duration::from_millis(200)).await;
         }
 
+        // Close the file
+        jsonl_file.flush().await?;
+        drop(jsonl_file);
+
+        // Upload the consolidated JSONL file to S3
+        if total_successful > 0 {
+            self.upload_jsonl_file(&jsonl_file_path, time_control, year, month).await?;
+        }
+
+        // Clean up local file
+        fs::remove_file(&jsonl_file_path).await?;
+
         info!("{}: Completed - {}/{} players successful", time_control, total_successful, total_processed);
         Ok((total_processed, total_successful))
+    }
+
+    async fn upload_jsonl_file(&self, local_file_path: &str, time_control: &str, year: u32, month: u32) -> Result<()> {
+        let file_content = fs::read(local_file_path).await?;
+        let s3_key = format!("consolidated/calculations/{}-{:02}/{}.jsonl", year, month, time_control);
+        
+        self.s3_client
+            .put_object()
+            .bucket(&self.s3_bucket)
+            .key(&s3_key)
+            .body(file_content.into())
+            .send()
+            .await?;
+
+        info!("Uploaded consolidated JSONL file: {}", s3_key);
+        Ok(())
     }
 
     async fn download_active_players(&self, time_control: &str, year: u32, month: u32) -> Result<Vec<String>> {
@@ -218,14 +273,7 @@ impl PlayerCalculationScraper {
         }
     }
 
-    async fn process_single_player(&self, player_id: &str, time_control: &str, year: u32, month: u32) -> Result<bool> {
-        let s3_key = format!("persistent/calculations/{}-{:02}/{}/{}.json", year, month, time_control, player_id);
-
-        // Check if already processed
-        if self.check_s3_file_exists(&s3_key).await.unwrap_or(false) {
-            return Ok(true);
-        }
-
+    async fn process_single_player(&self, player_id: &str, time_control: &str, year: u32, month: u32) -> Result<Option<PlayerCalculationRecord>> {
         let tc_code = match time_control {
             "standard" => "0",
             "rapid" => "1", 
@@ -249,17 +297,21 @@ impl PlayerCalculationScraper {
                 if html_content.contains("No calculations available") ||
                    html_content.contains("No games") ||
                    html_content.trim().len() < 100 {
-                    return Ok(true); // Normal case
+                    return Ok(None); // Normal case - no data
                 }
 
-                // Extract and save data
+                // Extract data
                 let calculation_data = self.extract_calculation_data(&html_content)?;
                 if !calculation_data.tournaments.is_empty() {
-                    self.save_and_upload_calculation(calculation_data, player_id, time_control, year, month, &s3_key).await?;
+                    Ok(Some(PlayerCalculationRecord {
+                        player_id: player_id.to_string(),
+                        calculation_data,
+                    }))
+                } else {
+                    Ok(None)
                 }
-                Ok(true)
             }
-            _ => Ok(false), // Failed but don't retry to maintain speed
+            _ => Ok(None), // Failed but don't retry to maintain speed
         }
     }
 
@@ -337,37 +389,6 @@ impl PlayerCalculationScraper {
         Ok(CalculationData { tournaments })
     }
 
-    async fn save_and_upload_calculation(
-        &self, calculation_data: CalculationData, player_id: &str, 
-        time_control: &str, year: u32, month: u32, s3_key: &str,
-    ) -> Result<()> {
-        let local_dir = format!("{}/calculations/{}-{:02}/{}", self.local_temp_dir, year, month, time_control);
-        fs::create_dir_all(&local_dir).await?;
-
-        let local_file = format!("{}/{}.json", local_dir, player_id);
-        let json_content = serde_json::to_string(&calculation_data)?;
-        fs::write(&local_file, &json_content).await?;
-
-        // Upload to S3
-        self.s3_client
-            .put_object()
-            .bucket(&self.s3_bucket)
-            .key(s3_key)
-            .body(json_content.into_bytes().into())
-            .send()
-            .await?;
-
-        fs::remove_file(&local_file).await?;
-        Ok(())
-    }
-
-    async fn check_s3_file_exists(&self, s3_key: &str) -> Result<bool> {
-        match self.s3_client.head_object().bucket(&self.s3_bucket).key(s3_key).send().await {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
-    }
-
     async fn upload_completion_marker(&self, month_str: &str, successful: &[(String, usize, usize)], failed: &[(String, String)]) -> Result<()> {
         let mut statistics = HashMap::new();
         statistics.insert("time_controls_processed".to_string(), serde_json::Value::Number((successful.len() + failed.len()).into()));
@@ -388,7 +409,8 @@ impl PlayerCalculationScraper {
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "statistics": statistics,
             "step": "calculation_scraping",
-            "method": "rust_optimized"
+            "method": "rust_optimized_jsonl",
+            "output_format": "consolidated_jsonl"
         });
 
         let local_file = format!("{}/calculation_scraping_completion_{}.json", self.local_temp_dir, month_str);
@@ -415,7 +437,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
-    info!("Starting Rust calculation scraper for {}", args.month);
+    info!("Starting Rust calculation scraper (JSONL output) for {}", args.month);
 
     let scraper = PlayerCalculationScraper::new(args.s3_bucket, args.aws_region).await?;
     scraper.scrape_calculations_for_month(&args.month).await?;
