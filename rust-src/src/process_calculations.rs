@@ -11,13 +11,42 @@ use std::path::PathBuf;
 use tokio::fs;
 use tracing::{error, info, warn};
 use regex::Regex;
+use rusqlite::{Connection, Result as SqliteResult};
 
 // Binary format constants
 const MAGIC_HEADER: &[u8; 8] = b"CHSSGAME";
+fn normalize_player_name(name: &str) -> String {
+    // Remove parentheses and content, extra spaces, lowercase, remove punctuation
+    let re = Regex::new(r"\([^)]*\)").unwrap();
+    let no_paren = re.replace_all(name, "");
+    no_paren
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect()
+}
 const FORMAT_VERSION: u16 = 1;
 
 // Time controls
 const TIME_CONTROLS: &[&str] = &["standard", "rapid", "blitz"];
+
+// Helper function for normalizing player names (used in blocking context)
+fn normalize_player_name(name: &str) -> String {
+    // Remove parentheses and content, extra spaces, lowercase, remove punctuation
+    let re = Regex::new(r"\([^)]*\)").unwrap();
+    let no_paren = re.replace_all(name, "");
+    no_paren
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect()
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "calculation-processor")]
@@ -101,8 +130,8 @@ struct ProcessingStats {
 
 // Player mapping structures
 struct PlayerMappings {
-    exact_mappings: HashMap<String, u64>,
-    normalized_mappings: HashMap<String, u64>,
+    exact_mappings: HashMap<String, String>,      // lowercase name -> player_id
+    normalized_mappings: HashMap<String, String>, // normalized name -> player_id
 }
 
 struct CalculationProcessor {
@@ -234,22 +263,66 @@ impl CalculationProcessor {
         self.download_file(&s3_key, &local_db_path).await
             .context("Failed to download player database")?;
         
-        // For this example, we'll create a simple hash-based mapping
-        // In a real implementation, you'd parse the SQLite database
-        let mut exact_mappings = HashMap::new();
-        let mut normalized_mappings = HashMap::new();
-        
-        // This is a placeholder - you'd implement actual SQLite reading here
-        // For now, we'll use a simple hash-based approach
-        info!("Pre-loaded player mappings for {}", time_control);
+        // Load player mappings from SQLite database
+        let player_mappings = tokio::task::spawn_blocking({
+            let local_db_path = local_db_path.clone();
+            let time_control = time_control.to_string();
+            move || -> Result<PlayerMappings> {
+                // Open SQLite connection
+                let conn = Connection::open(&local_db_path)
+                    .context("Failed to open SQLite database")?;
+                
+                // Test connection and get player count
+                let player_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM players",
+                    [],
+                    |row| row.get(0)
+                ).context("Failed to query player count")?;
+                
+                info!("Loading {} players from database for {}", player_count, time_control);
+                
+                // Pre-load all player mappings into memory
+                let mut exact_mappings = HashMap::new();
+                let mut normalized_mappings = HashMap::new();
+                
+                let mut stmt = conn.prepare("SELECT id, name FROM players")
+                    .context("Failed to prepare player query")?;
+                
+                let player_iter = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?, // id
+                        row.get::<_, String>(1)?, // name
+                    ))
+                }).context("Failed to execute player query")?;
+                
+                for player_result in player_iter {
+                    let (player_id, name) = player_result
+                        .context("Failed to read player row")?;
+                    
+                    // Store exact lowercase match
+                    exact_mappings.insert(name.to_lowercase(), player_id.clone());
+                    
+                    // Store normalized version
+                    let normalized = normalize_player_name(&name);
+                    if !normalized.is_empty() {
+                        normalized_mappings.insert(normalized, player_id);
+                    }
+                }
+                
+                info!("Pre-loaded {} exact mappings and {} normalized mappings for {}", 
+                      exact_mappings.len(), normalized_mappings.len(), time_control);
+                
+                Ok(PlayerMappings {
+                    exact_mappings,
+                    normalized_mappings,
+                })
+            }
+        }).await??;
         
         // Clean up database file
         fs::remove_file(&local_db_path).await?;
         
-        Ok(PlayerMappings {
-            exact_mappings,
-            normalized_mappings,
-        })
+        Ok(player_mappings)
     }
 
     async fn process_jsonl_file(&self, jsonl_path: &PathBuf, player_mappings: &PlayerMappings) -> Result<(Vec<ProcessedPlayer>, ProcessingStats)> {
@@ -311,7 +384,23 @@ impl CalculationProcessor {
                 }
                 
                 let score = self.convert_result_to_score(&game.result)?;
-                let opponent_id_hash = self.get_player_id_hash(opponent_name, player_mappings);
+                let mut opponent_id = self.get_player_id_from_name(opponent_name, player_mappings);
+                
+                // If we couldn't find the opponent, try the tournament database
+                if opponent_id.is_none() {
+                    if let Ok(Some(found_id)) = self.find_opponent_in_tournament_data(opponent_name, &tournament.tournament_id, "standard").await {
+                        opponent_id = Some(found_id);
+                    }
+                }
+                
+                let opponent_id_hash = match opponent_id {
+                    Some(id) => self.hash_string(&id),
+                    None => {
+                        warn!("Could not resolve opponent ID for '{}' in tournament {}, player {}", 
+                              opponent_name, tournament.tournament_id, player_record.player_id);
+                        continue; // Skip this game if we can't resolve opponent
+                    }
+                };
                 
                 let opponent_rating = game.opponent_rating
                     .as_ref()
@@ -354,16 +443,37 @@ impl CalculationProcessor {
         }
     }
 
+    fn get_player_id_from_name(&self, name: &str, player_mappings: &PlayerMappings) -> Option<String> {
+        if name.is_empty() {
+            return None;
+        }
+        
+        // Try exact match first (case-insensitive)
+        if let Some(id) = player_mappings.exact_mappings.get(&name.to_lowercase()) {
+            return Some(id.clone());
+        }
+        
+        // Try normalized match
+        let normalized_name = self.normalize_player_name(name);
+        if !normalized_name.is_empty() {
+            if let Some(id) = player_mappings.normalized_mappings.get(&normalized_name) {
+                return Some(id.clone());
+            }
+        }
+        
+        None
+    }
+
     fn get_player_id_hash(&self, name: &str, player_mappings: &PlayerMappings) -> u64 {
         // Try exact match first
-        if let Some(&id) = player_mappings.exact_mappings.get(&name.to_lowercase()) {
-            return id;
+        if let Some(id) = player_mappings.exact_mappings.get(&name.to_lowercase()) {
+            return self.hash_string(id);
         }
         
         // Try normalized match
         let normalized = self.normalize_player_name(name);
-        if let Some(&id) = player_mappings.normalized_mappings.get(&normalized) {
-            return id;
+        if let Some(id) = player_mappings.normalized_mappings.get(&normalized) {
+            return self.hash_string(id);
         }
         
         // Fallback: hash the name directly
