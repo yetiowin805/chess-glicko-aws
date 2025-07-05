@@ -435,7 +435,7 @@ class CalculationProcessor:
         if normalized_name and time_control in self.player_mappings_normalized:
             for stored_name, player_id in self.player_mappings_normalized[time_control].items():
                 if normalized_name in stored_name or stored_name in normalized_name:
-                    logger.warning(f"Partial match found for '{name}': {player_id}")
+                    logger.warning(f"Partial match found for '{name}': {stored_name} -> {player_id}")
                     return player_id
         
         return None
@@ -486,7 +486,7 @@ class CalculationProcessor:
             return None
             
         except Exception as e:
-            logger.debug(f"Could not find opponent '{opponent_name}' in tournament database for {tournament_id}: {str(e)}")
+            logger.warning(f"ERROR: Could not find opponent '{opponent_name}' in tournament database for {tournament_id}: {str(e)}")
             return None
 
     async def _get_tournament_database(self, time_control: str) -> Optional[str]:
