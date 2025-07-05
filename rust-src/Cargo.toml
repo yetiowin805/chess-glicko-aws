@@ -7,6 +7,10 @@ edition = "2021"
 name = "calculation-scraper"
 path = "src/scrape_calculations.rs"
 
+[[bin]]
+name = "calculation-processor"
+path = "src/process_calculations.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.32", features = ["full"] }
@@ -45,3 +49,6 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 
 # Time handling
 chrono = { version = "0.4.31", features = ["serde"] }
+
+# Compression
+flate2 = "1.0"

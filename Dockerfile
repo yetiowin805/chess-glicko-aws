@@ -13,8 +13,9 @@ WORKDIR /rust-build
 # Copy Cargo.toml first for better caching
 COPY rust-src/Cargo.toml ./Cargo.toml
 
-# Create dummy scrape_calculations.rs to match the binary target in Cargo.toml
+# Create dummy files to match the binary targets in Cargo.toml
 RUN mkdir -p src && echo "fn main() {}" > src/scrape_calculations.rs
+RUN mkdir -p src && echo "fn main() {}" > src/process_calculations.rs
 
 # Build dependencies first (this layer will be cached)
 RUN cargo build --release && rm -rf src target/release/deps/calculation*
@@ -22,8 +23,9 @@ RUN cargo build --release && rm -rf src target/release/deps/calculation*
 # Now copy actual source code
 COPY rust-src/src ./src
 
-# Build the actual application
-RUN cargo build --release
+# Build both binaries
+RUN cargo build --release --bin calculation-scraper
+RUN cargo build --release --bin calculation-processor
 
 # Main application stage
 FROM python:3.11-slim
@@ -51,13 +53,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy Python source code
 COPY src/ ./src/
 
-# Copy the compiled Rust binary from builder stage
+# Copy both compiled Rust binaries from builder stage
 COPY --from=rust-builder /rust-build/target/release/calculation-scraper ./bin/
+COPY --from=rust-builder /rust-build/target/release/calculation-processor ./bin/
 
-# Make the Rust binary executable and verify it exists
+# Make the Rust binaries executable and verify they exist
 RUN chmod +x ./bin/calculation-scraper && \
+    chmod +x ./bin/calculation-processor && \
     ls -la ./bin/ && \
-    ./bin/calculation-scraper --help || echo "Binary installed successfully"
+    ./bin/calculation-scraper --help || echo "calculation-scraper binary installed successfully" && \
+    ./bin/calculation-processor --help || echo "calculation-processor binary installed successfully"
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

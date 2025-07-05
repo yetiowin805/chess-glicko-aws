@@ -50,6 +50,14 @@ validate_post_scraping_data() {
         missing_data="$missing_data\n- Calculation data (persistent/calculations/$PROCESS_MONTH/)"
     fi
     
+    # Check if processed calculation data already exists (to avoid reprocessing)
+    local processed_calc_count=$(aws s3 ls "s3://$S3_BUCKET/persistent/calculations_processed/" --recursive | grep "$PROCESS_MONTH" | wc -l)
+    if [ "$processed_calc_count" -gt 0 ]; then
+        log "⚠️  Processed calculation data already exists for $PROCESS_MONTH"
+        log "Found $processed_calc_count processed calculation files"
+        log "The calculation processor will skip processing if data already exists"
+    fi
+    
     if [ -n "$missing_data" ]; then
         log "ERROR: Required data is missing for post-scraping mode:"
         echo -e "$missing_data"
@@ -151,12 +159,12 @@ run_full_pipeline() {
 run_post_scraping_pipeline() {
     log "Running post-scraping pipeline steps..."
     
-    # Step 6: Process Calculation Data
-    log "Step 6: Processing calculation data..."
-    python src/process_calculations.py \
+    # Step 6: Process Calculation Data (Rust)
+    log "Step 6: Processing calculation data with Rust..."
+    calculation-processor \
         --month "$PROCESS_MONTH" \
-        --s3_bucket "$S3_BUCKET" \
-        --aws_region "$AWS_REGION"
+        --s3-bucket "$S3_BUCKET" \
+        --aws-region "$AWS_REGION"
 
     if [ $? -ne 0 ]; then
         log "ERROR: Calculation data processing failed"
@@ -224,13 +232,13 @@ EOF
 3. Scraped tournament IDs and processed tournament data in parallel
 4. Aggregated unique player IDs by time control
 5. Scraped individual player calculation data (games and results)
-6. Processed calculation data into compact format
+6. Processed calculation data into compact binary format (Rust)
 7. Calculated ratings (placeholder)
 8. Uploaded results (placeholder)
 EOF
         else
             cat >> /tmp/completion.txt << EOF
-6. Processed calculation data into compact format
+6. Processed calculation data into compact binary format (Rust)
 7. Calculated ratings (placeholder)
 8. Uploaded results (placeholder)
 
@@ -254,15 +262,15 @@ EOF
         fi
         
         cat >> /tmp/completion.txt << EOF
-- s3://$S3_BUCKET/persistent/calculations_processed/$PROCESS_MONTH/[time_control]/[player_id].json.gz
-- s3://$S3_BUCKET/persistent/calculations_processed/$PROCESS_MONTH/[time_control]/summary.json
+- s3://$S3_BUCKET/persistent/calculations_processed/$PROCESS_MONTH/[time_control].bin.gz
+- s3://$S3_BUCKET/results/$PROCESS_MONTH/calculation_processing_completion.json
 
 Data structure:
 - Tournament data is organized by time control (standard/rapid/blitz)
 - Each tournament file contains JSON lines with player ID and name
 - Active player lists contain unique player IDs per time control for the month
 - Calculation files contain detailed game data and results for each player
-- Processed calculations are compressed and optimized for rating calculations
+- Processed calculations are in compact binary format optimized for rating calculations
 - Player data is processed and ready for rating calculations
 EOF
         
@@ -298,9 +306,9 @@ if [ -n "$SNS_TOPIC_ARN" ]; then
     message="Chess Rating Pipeline ($PIPELINE_MODE mode) completed successfully for $PROCESS_MONTH."
     
     if [ "$PIPELINE_MODE" = "full" ]; then
-        message="$message Downloaded player data, processed it, scraped/processed tournament data in parallel, aggregated unique player IDs by time control, scraped individual player calculation data, and processed calculations."
+        message="$message Downloaded player data, processed it, scraped/processed tournament data in parallel, aggregated unique player IDs by time control, scraped individual player calculation data, and processed calculations into binary format."
     else
-        message="$message Processed calculation data and prepared for rating calculations."
+        message="$message Processed calculation data into binary format and prepared for rating calculations."
     fi
     
     aws sns publish \
