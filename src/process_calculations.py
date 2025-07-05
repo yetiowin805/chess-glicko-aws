@@ -200,16 +200,16 @@ class CalculationProcessor:
                 return {"status": "already_processed", "output_file": output_s3_key}
             
             # Download the consolidated JSONL file
-            jsonl_s3_key = f"consolidated/calculations/{self.month_str}/{time_control}_calculations.jsonl"
+            jsonl_s3_key = f"persistent/calculations/{self.month_str}/{time_control}.jsonl"
             
             if not await self._check_s3_file_exists_async(jsonl_s3_key):
-                logger.info(f"No consolidated calculation file found for {time_control}: {jsonl_s3_key}")
+                logger.info(f"No calculation file found for {time_control}: {jsonl_s3_key}")
                 return {"status": "no_data", "files_found": 0}
             
-            logger.info(f"Found consolidated calculation file for {time_control}: {jsonl_s3_key}")
+            logger.info(f"Found calculation file for {time_control}: {jsonl_s3_key}")
             
             # Download and process the JSONL file
-            local_jsonl_path = os.path.join(self.local_temp_dir, f"{time_control}_calculations.jsonl")
+            local_jsonl_path = os.path.join(self.local_temp_dir, f"{time_control}.jsonl")
             await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.s3_client.download_file(self.s3_bucket, jsonl_s3_key, local_jsonl_path)
@@ -386,6 +386,13 @@ class CalculationProcessor:
             normalized_match = self.player_mappings_normalized[time_control].get(normalized_name)
             if normalized_match:
                 return normalized_match
+        
+        # # Try partial matching on normalized names (slower but still in-memory)
+        # if normalized_name and time_control in self.player_mappings_normalized:
+        #     for stored_name, player_id in self.player_mappings_normalized[time_control].items():
+        #         if normalized_name in stored_name or stored_name in normalized_name:
+        #             logger.warning(f"Partial match found for '{name}': {stored_name} -> {player_id}")
+        #             return player_id
         
         return None
 

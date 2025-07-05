@@ -238,7 +238,7 @@ impl PlayerCalculationScraper {
 
     async fn upload_jsonl_file(&self, local_file_path: &str, time_control: &str, year: u32, month: u32) -> Result<()> {
         let file_content = fs::read(local_file_path).await?;
-        let s3_key = format!("consolidated/calculations/{}-{:02}/{}.jsonl", year, month, time_control);
+        let s3_key = format!("persistent/calculations/{}-{:02}/{}.jsonl", year, month, time_control);
         
         self.s3_client
             .put_object()
@@ -248,7 +248,7 @@ impl PlayerCalculationScraper {
             .send()
             .await?;
 
-        info!("Uploaded consolidated JSONL file: {}", s3_key);
+        info!("Uploaded JSONL file: {}", s3_key);
         Ok(())
     }
 
