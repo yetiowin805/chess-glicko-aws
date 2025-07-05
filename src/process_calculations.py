@@ -425,7 +425,6 @@ class CalculationProcessor:
 
             conn.close()
             
-            logger.warning(f"No match found for '{opponent_name}' in tournament {tournament_id}")
             return None
             
         except Exception as e:
