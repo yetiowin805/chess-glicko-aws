@@ -368,7 +368,6 @@ class CalculationProcessor:
                         opponent_rating_int = None
                         
                     if not opponent_id:
-                        logger.warning(f"Could not resolve opponent ID for '{opponent_name}' in tournament {tournament_id}, player {player_id}. Trying tournament data...")
                         # Fallback: try to find opponent in tournament data
                         opponent_id = await self._find_opponent_in_tournament_data(opponent_name, tournament_id, time_control)
                         
@@ -431,12 +430,12 @@ class CalculationProcessor:
             if normalized_match:
                 return normalized_match
         
-        # Try partial matching on normalized names (slower but still in-memory)
-        if normalized_name and time_control in self.player_mappings_normalized:
-            for stored_name, player_id in self.player_mappings_normalized[time_control].items():
-                if normalized_name in stored_name or stored_name in normalized_name:
-                    logger.warning(f"Partial match found for '{name}': {stored_name} -> {player_id}")
-                    return player_id
+        # # Try partial matching on normalized names (slower but still in-memory)
+        # if normalized_name and time_control in self.player_mappings_normalized:
+        #     for stored_name, player_id in self.player_mappings_normalized[time_control].items():
+        #         if normalized_name in stored_name or stored_name in normalized_name:
+        #             logger.warning(f"Partial match found for '{name}': {stored_name} -> {player_id}")
+        #             return player_id
         
         return None
 
@@ -466,21 +465,9 @@ class CalculationProcessor:
                 conn.close()
                 logger.debug(f"Found opponent '{opponent_name}' in tournament {tournament_id} via exact match")
                 return result[0]
-            
-            logger.warning(f"No exact match found for '{opponent_name}' in tournament {tournament_id}")
-            # Try partial match if exact match fails
-            cursor.execute("""
-                SELECT player_id FROM tournament_players 
-                WHERE tournament_id = ? AND LOWER(player_name) LIKE LOWER(?)
-                LIMIT 1
-            """, (tournament_id, f"%{opponent_name}%"))
-            
-            result = cursor.fetchone()
+
             conn.close()
-            
-            if result:
-                logger.debug(f"Found opponent '{opponent_name}' in tournament {tournament_id} via partial match: {result[0]}")
-                return result[0]
+
             
             logger.warning(f"No match found for '{opponent_name}' in tournament {tournament_id}")
             return None
