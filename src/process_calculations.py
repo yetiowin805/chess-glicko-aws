@@ -31,7 +31,6 @@ class CalculationProcessor:
         self.month_str = month_str
         # Cache for SQLite database connections
         self.db_connections = {}  # time_control -> connection
-        self.batch_size = 100  # Process files in batches
         
         logger.info(f"Initialized calculation processor - S3 bucket: {s3_bucket}, Region: {aws_region}")
 
@@ -108,7 +107,7 @@ class CalculationProcessor:
             
             self.db_connections[time_control] = conn
             
-            # NEW: Pre-load all player mappings into memory
+            # Pre-load all player mappings into memory
             await self._preload_player_mappings(time_control)
             
             logger.info(f"Loaded player database for {time_control} with {player_count} players")
@@ -191,7 +190,7 @@ class CalculationProcessor:
         return normalized
 
     async def _process_time_control(self, time_control: str) -> Dict:
-        """Process all calculation files for a specific time control"""
+        """Process consolidated JSONL calculation file for a specific time control"""
         
         try:
             # Check if already processed
@@ -200,33 +199,27 @@ class CalculationProcessor:
                 logger.info(f"Processed calculations already exist for {time_control}: {output_s3_key}")
                 return {"status": "already_processed", "output_file": output_s3_key}
             
-            # List all calculation files for this time control
-            calculation_files = await self._list_calculation_files(time_control)
+            # Download the consolidated JSONL file
+            jsonl_s3_key = f"consolidated/calculations/{self.month_str}/{time_control}_calculations.jsonl"
             
-            if not calculation_files:
-                logger.info(f"No calculation files found for {time_control}")
+            if not await self._check_s3_file_exists_async(jsonl_s3_key):
+                logger.info(f"No consolidated calculation file found for {time_control}: {jsonl_s3_key}")
                 return {"status": "no_data", "files_found": 0}
             
-            logger.info(f"Found {len(calculation_files)} calculation files for {time_control}")
+            logger.info(f"Found consolidated calculation file for {time_control}: {jsonl_s3_key}")
             
-            # Process files in batches
-            all_processed_data = []
-            failed_files = []
+            # Download and process the JSONL file
+            local_jsonl_path = os.path.join(self.local_temp_dir, f"{time_control}_calculations.jsonl")
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.s3_client.download_file(self.s3_bucket, jsonl_s3_key, local_jsonl_path)
+            )
             
-            for i in range(0, len(calculation_files), self.batch_size):
-                batch = calculation_files[i:i + self.batch_size]
-                batch_num = i // self.batch_size + 1
-                total_batches = (len(calculation_files) + self.batch_size - 1) // self.batch_size
-                
-                logger.info(f"{time_control}: Processing batch {batch_num}/{total_batches} ({len(batch)} files)")
-                
-                batch_data, batch_failed = await self._process_calculation_batch(batch, time_control)
-                
-                all_processed_data.extend(batch_data)
-                failed_files.extend(batch_failed)
-                
-                logger.info(f"{time_control}: Batch {batch_num} completed - "
-                          f"{len(batch_data)} processed, {len(batch_failed)} failed")
+            # Process the JSONL file
+            all_processed_data, total_players, failed_players = await self._process_jsonl_file(local_jsonl_path, time_control)
+            
+            # Clean up downloaded file
+            os.remove(local_jsonl_path)
             
             # Save processed data
             if all_processed_data:
@@ -234,9 +227,9 @@ class CalculationProcessor:
                 
             result = {
                 "status": "completed",
-                "total_files": len(calculation_files),
+                "total_players": total_players,
                 "processed_successfully": len(all_processed_data),
-                "failed_files": len(failed_files),
+                "failed_players": failed_players,
                 "output_file": output_s3_key if all_processed_data else None
             }
             
@@ -247,92 +240,56 @@ class CalculationProcessor:
             logger.error(f"Error processing time control {time_control}: {str(e)}")
             return {"status": "error", "error": str(e)}
 
-    async def _list_calculation_files(self, time_control: str) -> List[str]:
-        """List all calculation files for a time control from S3"""
-        prefix = f"persistent/calculations/{self.month_str}/{time_control}/"
-        
-        try:
-            paginator = self.s3_client.get_paginator('list_objects_v2')
-            files = []
-            
-            async for page in self._paginate_async(paginator, Bucket=self.s3_bucket, Prefix=prefix):
-                if 'Contents' in page:
-                    for obj in page['Contents']:
-                        key = obj['Key']
-                        if key.endswith('.json') and key != prefix:  # Exclude directory marker
-                            files.append(key)
-            
-            return files
-            
-        except Exception as e:
-            logger.error(f"Error listing calculation files for {time_control}: {str(e)}")
-            return []
-
-    async def _paginate_async(self, paginator, **kwargs):
-        """Async wrapper for S3 pagination"""
-        loop = asyncio.get_event_loop()
-        page_iterator = paginator.paginate(**kwargs)
-        
-        for page in page_iterator:
-            yield await loop.run_in_executor(None, lambda: page)
-
-    async def _process_calculation_batch(self, file_keys: List[str], time_control: str) -> Tuple[List[Dict], List[str]]:
-        """Process a batch of calculation files with parallel processing"""
+    async def _process_jsonl_file(self, jsonl_file_path: str, time_control: str) -> Tuple[List[Dict], int, int]:
+        """Process the consolidated JSONL file"""
         processed_data = []
-        failed_files = []
+        total_players = 0
+        failed_players = 0
         
-        # Download all files in parallel (already optimized)
-        download_tasks = [self._download_calculation_file(key) for key in file_keys]
-        download_results = await asyncio.gather(*download_tasks, return_exceptions=True)
-        
-        # Process files in parallel
-        process_tasks = []
-        valid_files = []
-        
-        for i, result in enumerate(download_results):
-            file_key = file_keys[i]
-            
-            if isinstance(result, Exception):
-                logger.warning(f"Failed to download {file_key}: {result}")
-                failed_files.append(file_key)
-                continue
-            
-            # Extract player ID from file path
-            player_id = file_key.split('/')[-1].replace('.json', '')
-            
-            # Create processing task
-            process_tasks.append(self._process_single_calculation(result, player_id, time_control))
-            valid_files.append(file_key)
-        
-        # Process all files in parallel
-        process_results = await asyncio.gather(*process_tasks, return_exceptions=True)
-        
-        # Collect results
-        for i, result in enumerate(process_results):
-            file_key = valid_files[i]
-            
-            if isinstance(result, Exception):
-                logger.warning(f"Failed to process {file_key}: {result}")
-                failed_files.append(file_key)
-            elif result:
-                processed_data.append(result)
-        
-        return processed_data, failed_files
-
-    async def _download_calculation_file(self, s3_key: str) -> Optional[Dict]:
-        """Download and parse a single calculation file"""
         try:
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.s3_client.get_object(Bucket=self.s3_bucket, Key=s3_key)
-            )
-            
-            content = response['Body'].read().decode('utf-8')
-            return json.loads(content)
+            # Read and process each line in the JSONL file
+            async with aiofiles.open(jsonl_file_path, 'r', encoding='utf-8') as f:
+                async for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                        
+                    total_players += 1
+                    
+                    try:
+                        # Parse the JSON line
+                        player_record = json.loads(line)
+                        player_id = player_record.get('player_id')
+                        calculation_data = player_record.get('calculation_data', {})
+                        
+                        if not player_id or not calculation_data:
+                            logger.warning(f"Invalid player record: missing player_id or calculation_data")
+                            failed_players += 1
+                            continue
+                        
+                        # Process this player's calculation data
+                        processed_player = await self._process_single_calculation(calculation_data, player_id, time_control)
+                        
+                        if processed_player:
+                            processed_data.append(processed_player)
+                        else:
+                            failed_players += 1
+                            
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Failed to parse JSON line: {e}")
+                        failed_players += 1
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Error processing player record: {e}")
+                        failed_players += 1
+                        continue
+                        
+            logger.info(f"{time_control}: Processed {total_players} players, {len(processed_data)} successful, {failed_players} failed")
+            return processed_data, total_players, failed_players
             
         except Exception as e:
-            logger.warning(f"Error downloading {s3_key}: {str(e)}")
-            return None
+            logger.error(f"Error processing JSONL file {jsonl_file_path}: {str(e)}")
+            return [], 0, 0
 
     async def _process_single_calculation(self, calculation_data: Dict, player_id: str, time_control: str) -> Optional[Dict]:
         """Process a single player's calculation data into compact format"""
@@ -430,13 +387,6 @@ class CalculationProcessor:
             if normalized_match:
                 return normalized_match
         
-        # # Try partial matching on normalized names (slower but still in-memory)
-        # if normalized_name and time_control in self.player_mappings_normalized:
-        #     for stored_name, player_id in self.player_mappings_normalized[time_control].items():
-        #         if normalized_name in stored_name or stored_name in normalized_name:
-        #             logger.warning(f"Partial match found for '{name}': {stored_name} -> {player_id}")
-        #             return player_id
-        
         return None
 
     async def _find_opponent_in_tournament_data(self, opponent_name: str, tournament_id: str, time_control: str) -> Optional[str]:
@@ -467,14 +417,12 @@ class CalculationProcessor:
                 return result[0]
 
             conn.close()
-
             
             logger.warning(f"No match found for '{opponent_name}' in tournament {tournament_id}")
-            logger.warning(f"Normalized name: {normalized_name}")
             return None
             
         except Exception as e:
-            logger.warning(f"ERROR: Could not find opponent '{opponent_name}' in tournament database for {tournament_id}: {str(e)}")
+            logger.warning(f"Could not find opponent '{opponent_name}' in tournament database for {tournament_id}: {str(e)}")
             return None
 
     async def _get_tournament_database(self, time_control: str) -> Optional[str]:
@@ -560,21 +508,22 @@ class CalculationProcessor:
                 "month": self.month_str,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "step": "calculation_processing",
+                "input_format": "consolidated_jsonl",
                 "results": {}
             }
             
             total_processed = 0
-            total_files = 0
+            total_players = 0
             
             for time_control, result in results:
                 completion_data["results"][time_control] = result
                 
                 if result.get("status") == "completed":
                     total_processed += result.get("processed_successfully", 0)
-                    total_files += result.get("total_files", 0)
+                    total_players += result.get("total_players", 0)
             
             completion_data["summary"] = {
-                "total_files_processed": total_files,
+                "total_players_processed": total_players,
                 "total_calculations_processed": total_processed,
                 "time_controls": len(results)
             }
@@ -597,7 +546,7 @@ class CalculationProcessor:
             logger.warning(f"Failed to upload processing completion marker: {str(e)}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Process FIDE calculation data into compact format.")
+    parser = argparse.ArgumentParser(description="Process FIDE calculation data from consolidated JSONL format.")
     parser.add_argument(
         "--month",
         type=str,
