@@ -108,6 +108,9 @@ class CalculationProcessor:
             
             self.db_connections[time_control] = conn
             
+            # NEW: Pre-load all player mappings into memory
+            await self._preload_player_mappings(time_control)
+            
             logger.info(f"Loaded player database for {time_control} with {player_count} players")
             
         except ClientError as e:
@@ -116,6 +119,36 @@ class CalculationProcessor:
         except Exception as e:
             logger.error(f"Error loading player database for {time_control}: {str(e)}")
             raise
+
+    async def _preload_player_mappings(self, time_control: str):
+        """Pre-load all player name->ID mappings into memory for fast lookups"""
+        if not hasattr(self, 'player_mappings'):
+            self.player_mappings = {}
+            self.player_mappings_normalized = {}
+        
+        conn = self.db_connections[time_control]
+        cursor = conn.cursor()
+        
+        logger.info(f"Pre-loading player mappings for {time_control}...")
+        
+        # Load all players with their names
+        cursor.execute("SELECT id, name FROM players")
+        
+        self.player_mappings[time_control] = {}
+        self.player_mappings_normalized[time_control] = {}
+        
+        for row in cursor.fetchall():
+            player_id, name = row
+            
+            # Store exact lowercase match
+            self.player_mappings[time_control][name.lower()] = player_id
+            
+            # Store normalized version
+            normalized = self._normalize_player_name(name)
+            if normalized:
+                self.player_mappings_normalized[time_control][normalized] = player_id
+        
+        logger.info(f"Pre-loaded {len(self.player_mappings[time_control])} player mappings for {time_control}")
 
     async def _close_database_connection(self, time_control: str):
         """Close database connection for a specific time control"""
@@ -244,15 +277,18 @@ class CalculationProcessor:
             yield await loop.run_in_executor(None, lambda: page)
 
     async def _process_calculation_batch(self, file_keys: List[str], time_control: str) -> Tuple[List[Dict], List[str]]:
-        """Process a batch of calculation files"""
+        """Process a batch of calculation files with parallel processing"""
         processed_data = []
         failed_files = []
         
-        # Download all files in batch
+        # Download all files in parallel (already optimized)
         download_tasks = [self._download_calculation_file(key) for key in file_keys]
         download_results = await asyncio.gather(*download_tasks, return_exceptions=True)
         
-        # Process each file
+        # Process files in parallel
+        process_tasks = []
+        valid_files = []
+        
         for i, result in enumerate(download_results):
             file_key = file_keys[i]
             
@@ -261,19 +297,25 @@ class CalculationProcessor:
                 failed_files.append(file_key)
                 continue
             
-            try:
-                # Extract player ID from file path
-                player_id = file_key.split('/')[-1].replace('.json', '')
-                
-                # Process the calculation data
-                processed_calc = await self._process_single_calculation(result, player_id, time_control)
-                
-                if processed_calc:
-                    processed_data.append(processed_calc)
-                    
-            except Exception as e:
-                logger.warning(f"Failed to process {file_key}: {str(e)}")
+            # Extract player ID from file path
+            player_id = file_key.split('/')[-1].replace('.json', '')
+            
+            # Create processing task
+            process_tasks.append(self._process_single_calculation(result, player_id, time_control))
+            valid_files.append(file_key)
+        
+        # Process all files in parallel
+        process_results = await asyncio.gather(*process_tasks, return_exceptions=True)
+        
+        # Collect results
+        for i, result in enumerate(process_results):
+            file_key = valid_files[i]
+            
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to process {file_key}: {result}")
                 failed_files.append(file_key)
+            elif result:
+                processed_data.append(result)
         
         return processed_data, failed_files
 
@@ -373,47 +415,30 @@ class CalculationProcessor:
             return None
 
     async def _get_player_id_from_name(self, name: str, time_control: str) -> Optional[str]:
-        """Get player ID from name using SQLite database"""
-        if not name or time_control not in self.db_connections:
+        """Get player ID from name using in-memory mappings (much faster)"""
+        if not name or time_control not in self.player_mappings:
             return None
         
-        try:
-            conn = self.db_connections[time_control]
-            cursor = conn.cursor()
-            
-            # Try exact match first (case-insensitive)
-            cursor.execute("SELECT id FROM players WHERE LOWER(name) = LOWER(?) LIMIT 1", (name,))
-            result = cursor.fetchone()
-            
-            if result:
-                return result[0]
-            
-            # Try partial match if exact match fails
-            cursor.execute("SELECT id FROM players WHERE LOWER(name) LIKE LOWER(?) ORDER BY rating DESC LIMIT 1", (f"%{name}%",))
-            result = cursor.fetchone()
-            
-            if result:
-                logger.warning(f"Partial match found for '{name}': {result[0]}")
-                return result[0]
-            
-            # Try normalized name matching
-            normalized_name = self._normalize_player_name(name)
-            if normalized_name:
-                cursor.execute("""
-                    SELECT id FROM players 
-                    WHERE LOWER(REPLACE(REPLACE(name, ',', ''), '.', '')) LIKE LOWER(?) 
-                    ORDER BY rating DESC LIMIT 1
-                """, (f"%{normalized_name}%",))
-                result = cursor.fetchone()
-                
-                if result:
-                    return result[0]
-            
-            return None
-            
-        except Exception as e:
-            logger.warning(f"Error looking up player ID for '{name}': {str(e)}")
-            return None
+        # Try exact match first (case-insensitive)
+        exact_match = self.player_mappings[time_control].get(name.lower())
+        if exact_match:
+            return exact_match
+        
+        # Try normalized match
+        normalized_name = self._normalize_player_name(name)
+        if normalized_name and time_control in self.player_mappings_normalized:
+            normalized_match = self.player_mappings_normalized[time_control].get(normalized_name)
+            if normalized_match:
+                return normalized_match
+        
+        # Try partial matching on normalized names (slower but still in-memory)
+        if normalized_name and time_control in self.player_mappings_normalized:
+            for stored_name, player_id in self.player_mappings_normalized[time_control].items():
+                if normalized_name in stored_name or stored_name in normalized_name:
+                    logger.warning(f"Partial match found for '{name}': {player_id}")
+                    return player_id
+        
+        return None
 
     async def _find_opponent_in_tournament_data(self, opponent_name: str, tournament_id: str, time_control: str) -> Optional[str]:
         """Fallback method to find opponent in tournament SQLite database"""
