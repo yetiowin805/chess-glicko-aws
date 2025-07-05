@@ -3,6 +3,7 @@ import json
 import argparse
 import boto3
 import logging
+import sqlite3
 from datetime import datetime
 from botocore.exceptions import ClientError
 
@@ -31,14 +32,14 @@ class FIDEDataProcessor:
             needs_multiple_lists = year > 2012 or (year == 2012 and month >= 9)
             
             if needs_multiple_lists:
-                # Process all three rating lists
+                # Process all three rating lists into separate SQLite files
                 time_controls = ["standard", "rapid", "blitz"]
                 processed_files = []
                 
                 for time_control in time_controls:
                     # Define S3 keys
                     raw_s3_key = f"persistent/player_info/raw/{time_control}/{year}-{month:02d}.txt"
-                    processed_s3_key = f"persistent/player_info/processed/{time_control}/{year}-{month:02d}.txt"
+                    processed_s3_key = f"persistent/player_info/processed/{time_control}/{year}-{month:02d}.db"
                     
                     # Check if processed file already exists in S3
                     if self._check_s3_file_exists(processed_s3_key):
@@ -53,7 +54,7 @@ class FIDEDataProcessor:
                         continue
                     
                     # Process the file
-                    local_processed_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}_{time_control}_processed.txt")
+                    local_processed_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}_{time_control}_processed.db")
                     success = self._process_file(local_raw_file, local_processed_file, year, month, time_control)
                     
                     if success:
@@ -74,7 +75,7 @@ class FIDEDataProcessor:
                 # Process only standard rating list (pre-2012 format)
                 # Define S3 keys
                 raw_s3_key = f"persistent/player_info/raw/standard/{year}-{month:02d}.txt"
-                processed_s3_key = f"persistent/player_info/processed/standard/{year}-{month:02d}.txt"
+                processed_s3_key = f"persistent/player_info/processed/standard/{year}-{month:02d}.db"
                 
                 # Check if processed file already exists in S3
                 if self._check_s3_file_exists(processed_s3_key):
@@ -88,7 +89,7 @@ class FIDEDataProcessor:
                     return False
                 
                 # Process the file
-                local_processed_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}_processed.txt")
+                local_processed_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}_processed.db")
                 success = self._process_file(local_raw_file, local_processed_file, year, month)
                 
                 if success:
@@ -110,12 +111,28 @@ class FIDEDataProcessor:
             raise
     
     def _process_file(self, input_filename, output_filename, year, month, time_control=None):
-        """Process the raw FIDE data file and convert to JSON format"""
+        """Process the raw FIDE data file and convert to SQLite format"""
         try:
             lengths, keys = self._get_format_config(year, month)
             
-            with open(input_filename, "r", encoding="utf-8", errors="replace") as input_file, \
-                 open(output_filename, "w") as output_file:
+            # Create SQLite database
+            conn = sqlite3.connect(output_filename)
+            conn.execute('PRAGMA journal_mode=WAL')  # Better performance for writes
+            conn.execute('PRAGMA synchronous=NORMAL')  # Better performance
+            
+            # Create table with appropriate schema based on format
+            create_table_sql = self._get_create_table_sql(keys)
+            conn.execute(create_table_sql)
+            
+            # Create indexes for fast lookups
+            # Primary key (id) is automatically indexed
+            conn.execute('CREATE INDEX idx_name ON players(name)')
+            
+            # Prepare insert statement
+            placeholders = ', '.join(['?' for _ in keys])
+            insert_sql = f"INSERT INTO players ({', '.join(keys)}) VALUES ({placeholders})"
+            
+            with open(input_filename, "r", encoding="utf-8", errors="replace") as input_file:
                 
                 # Skip header line only for certain dates
                 if not (
@@ -126,23 +143,80 @@ class FIDEDataProcessor:
                     input_file.readline()
                 
                 line_count = 0
+                batch_data = []
+                batch_size = 1000
+                
                 for line in input_file:
                     try:
                         parts = self._process_line(line, lengths)
-                        json_object = {key: value for key, value in zip(keys, parts)}
-                        
-                        output_file.write(f"{json.dumps(json_object)}\n")
+                        # Convert data types as needed
+                        processed_parts = self._convert_data_types(parts, keys)
+                        batch_data.append(processed_parts)
                         line_count += 1
+                        
+                        # Insert in batches for better performance
+                        if len(batch_data) >= batch_size:
+                            conn.executemany(insert_sql, batch_data)
+                            batch_data = []
+                            
                     except Exception as e:
                         logger.warning(f"Failed to process line {line_count + 1}: {str(e)}")
                         continue
                 
-                logger.info(f"Processed {line_count} records for {time_control if time_control else 'standard'} rating list")
+                # Insert remaining data
+                if batch_data:
+                    conn.executemany(insert_sql, batch_data)
+                
+                conn.commit()
+                conn.close()
+                
+                logger.info(f"Processed {line_count} records into SQLite database for {time_control if time_control else 'standard'} rating list")
                 return True
                 
         except Exception as e:
             logger.error(f"Error processing file {input_filename}: {str(e)}")
             return False
+    
+    def _get_create_table_sql(self, keys):
+        """Generate CREATE TABLE SQL based on the keys"""
+        # Define column types based on field names
+        type_mapping = {
+            'id': 'TEXT PRIMARY KEY',
+            'name': 'TEXT NOT NULL',
+            'title': 'TEXT',
+            'fed': 'TEXT',
+            'rating': 'INTEGER',
+            'games': 'INTEGER',
+            'b_year': 'INTEGER',
+            'sex': 'TEXT',
+            'flag': 'TEXT',
+            'w_title': 'TEXT',
+            'o_title': 'TEXT',
+            'foa': 'TEXT',
+            'k': 'INTEGER'
+        }
+        
+        columns = []
+        for key in keys:
+            column_type = type_mapping.get(key, 'TEXT')
+            columns.append(f"{key} {column_type}")
+        
+        return f"CREATE TABLE players ({', '.join(columns)})"
+    
+    def _convert_data_types(self, parts, keys):
+        """Convert string data to appropriate types"""
+        converted = []
+        for i, (part, key) in enumerate(zip(parts, keys)):
+            if key in ['rating', 'games', 'b_year', 'k']:
+                # Convert to integer, handle empty strings
+                try:
+                    converted.append(int(part) if part else None)
+                except ValueError:
+                    converted.append(None)
+            else:
+                # Keep as string, but convert empty strings to None for cleaner data
+                converted.append(part if part else None)
+        return converted
     
     def _process_line(self, line, lengths):
         """Splits a line into parts of fixed lengths."""

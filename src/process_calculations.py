@@ -5,6 +5,7 @@ import asyncio
 import aiofiles
 import boto3
 import logging
+import sqlite3
 from datetime import datetime
 from typing import Dict, List, Set, Optional, Tuple
 from collections import defaultdict
@@ -23,25 +24,27 @@ DEFAULT_AWS_REGION = "us-east-2"
 TIME_CONTROLS = ["standard", "rapid", "blitz"]
 
 class CalculationProcessor:
-    def __init__(self, s3_bucket: str, aws_region: str = DEFAULT_AWS_REGION):
+    def __init__(self, s3_bucket: str, aws_region: str = DEFAULT_AWS_REGION, month_str: str = None):
         self.s3_bucket = s3_bucket
         self.s3_client = boto3.client('s3', region_name=aws_region)
         self.local_temp_dir = "/tmp/chess_data"
-        
-        # For processing efficiency
-        self.name_to_id_cache = {}  # Global cache for name->ID lookups
+        self.month_str = month_str
+        # Cache for SQLite database connections
+        self.db_connections = {}  # time_control -> connection
         self.batch_size = 100  # Process files in batches
         
         logger.info(f"Initialized calculation processor - S3 bucket: {s3_bucket}, Region: {aws_region}")
 
-    async def process_calculations_for_month(self, month_str: str):
+    async def process_calculations_for_month(self):
         """Process calculation data for all time controls for a specific month"""
         try:
-            year, month = map(int, month_str.split("-"))
-            logger.info(f"Starting calculation processing for {year}-{month:02d}")
+            logger.info(f"Starting calculation processing for {self.month_str}")
             
             # Setup local temp directory
             os.makedirs(self.local_temp_dir, exist_ok=True)
+            
+            # Parse year and month from month_str
+            year, month = map(int, self.month_str.split("-"))
             
             # Determine which time controls to process based on year
             time_controls_to_process = ["standard"]
@@ -54,72 +57,86 @@ class CalculationProcessor:
             results = []
             for time_control in time_controls_to_process:
                 try:
-                    # Load name-to-ID mapping for this specific time control
-                    await self._load_name_to_id_mapping(time_control, year, month)
+                    # Load SQLite database for this time control
+                    await self._load_player_database(time_control)
                     
-                    result = await self._process_time_control(time_control, year, month)
+                    result = await self._process_time_control(time_control)
                     results.append((time_control, result))
                     
-                    # Clear cache for next time control to avoid conflicts
-                    # self.name_to_id_cache.clear()
+                    # Close database connection for this time control
+                    await self._close_database_connection(time_control)
                     
                 except Exception as e:
                     logger.error(f"Error processing {time_control}: {str(e)}")
                     results.append((time_control, {"error": str(e)}))
             
             # Generate summary and upload completion marker
-            await self._upload_processing_completion_marker(month_str, results)
+            await self._upload_processing_completion_marker(results)
             
-            logger.info(f"Calculation processing completed for {month_str}")
+            logger.info(f"Calculation processing completed for {self.month_str}")
             return True
             
         except Exception as e:
             logger.error(f"Error in calculation processing: {str(e)}", exc_info=True)
             raise
+        finally:
+            # Ensure all database connections are closed
+            await self._cleanup_database_connections()
 
-    async def _load_name_to_id_mapping(self, time_control: str, year: int, month: int):
-        """Load name-to-ID mapping from processed player data for a specific time control"""
-        month_str = f"{month:02d}"
-        s3_key = f"persistent/player_info/processed/{time_control}/{year}-{month_str}.txt"
+    async def _load_player_database(self, time_control: str):
+        """Download and load SQLite database for player lookups"""
+        s3_key = f"persistent/player_info/processed/{time_control}/{self.month_str}.db"
+        local_db_path = os.path.join(self.local_temp_dir, f"{self.month_str}_{time_control}.db")
         
         try:
-            logger.info(f"Loading name-to-ID mapping from processed player data for {time_control}...")
+            logger.info(f"Downloading player database for {time_control}...")
             
-            # Download processed player data
-            response = await asyncio.get_event_loop().run_in_executor(
+            # Download SQLite database from S3
+            await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self.s3_client.get_object(Bucket=self.s3_bucket, Key=s3_key)
+                lambda: self.s3_client.download_file(self.s3_bucket, s3_key, local_db_path)
             )
             
-            content = response['Body'].read().decode('utf-8')
+            # Open database connection
+            conn = sqlite3.connect(local_db_path)
+            conn.row_factory = sqlite3.Row  # Return rows as dictionaries
             
-            # Parse each line and build mapping
-            count = 0
-            for line in content.strip().split('\n'):
-                if line.strip():
-                    try:
-                        player_data = json.loads(line)
-                        player_id = player_data.get('id', '').strip()
-                        player_name = player_data.get('name', '').strip()
-                        
-                        if player_id and player_name:
-                            # Normalize name for lookup (remove parenthesis and content, extra spaces, case, punctuation)
-                            normalized_name = self._normalize_player_name(player_name)
-                            self.name_to_id_cache[normalized_name] = player_id
-                            count += 1
-                            
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse player data line: {line[:100]}...")
-                        continue
+            # Test the connection and get player count
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM players")
+            player_count = cursor.fetchone()[0]
             
-            logger.info(f"Loaded {count} name-to-ID mappings for {time_control}")
+            self.db_connections[time_control] = conn
+            
+            logger.info(f"Loaded player database for {time_control} with {player_count} players")
             
         except ClientError as e:
-            logger.error(f"Failed to load player data for name-to-ID mapping ({time_control}): {str(e)}")
+            logger.error(f"Failed to download player database for {time_control}: {str(e)}")
             raise
         except Exception as e:
-            logger.error(f"Error loading name-to-ID mapping for {time_control}: {str(e)}")
+            logger.error(f"Error loading player database for {time_control}: {str(e)}")
             raise
+
+    async def _close_database_connection(self, time_control: str):
+        """Close database connection for a specific time control"""
+        if time_control in self.db_connections:
+            try:
+                self.db_connections[time_control].close()
+                del self.db_connections[time_control]
+                
+                # Also remove the local database file
+                local_db_path = os.path.join(self.local_temp_dir, f"{self.month_str}_{time_control}.db")
+                if os.path.exists(local_db_path):
+                    os.remove(local_db_path)
+                    
+                logger.debug(f"Closed database connection for {time_control}")
+            except Exception as e:
+                logger.warning(f"Error closing database connection for {time_control}: {str(e)}")
+
+    async def _cleanup_database_connections(self):
+        """Close all database connections and cleanup files"""
+        for time_control in list(self.db_connections.keys()):
+            await self._close_database_connection(time_control)
 
     def _normalize_player_name(self, name: str) -> str:
         """Normalize player name: remove parenthesis and content, extra spaces, lowercase, remove punctuation."""
@@ -129,19 +146,18 @@ class CalculationProcessor:
         normalized = ' '.join(name_no_paren.split()).strip().lower().translate(str.maketrans('', '', string.punctuation))
         return normalized
 
-    async def _process_time_control(self, time_control: str, year: int, month: int) -> Dict:
+    async def _process_time_control(self, time_control: str) -> Dict:
         """Process all calculation files for a specific time control"""
-        month_str = f"{month:02d}"
         
         try:
             # Check if already processed
-            output_s3_key = f"persistent/calculations_processed/{year}-{month_str}_{time_control}.json.gz"
+            output_s3_key = f"persistent/calculations_processed/{self.month_str}_{time_control}.json.gz"
             if await self._check_s3_file_exists_async(output_s3_key):
                 logger.info(f"Processed calculations already exist for {time_control}: {output_s3_key}")
                 return {"status": "already_processed", "output_file": output_s3_key}
             
             # List all calculation files for this time control
-            calculation_files = await self._list_calculation_files(time_control, year, month)
+            calculation_files = await self._list_calculation_files(time_control)
             
             if not calculation_files:
                 logger.info(f"No calculation files found for {time_control}")
@@ -160,7 +176,7 @@ class CalculationProcessor:
                 
                 logger.info(f"{time_control}: Processing batch {batch_num}/{total_batches} ({len(batch)} files)")
                 
-                batch_data, batch_failed = await self._process_calculation_batch(batch, time_control, year, month)
+                batch_data, batch_failed = await self._process_calculation_batch(batch, time_control)
                 
                 all_processed_data.extend(batch_data)
                 failed_files.extend(batch_failed)
@@ -170,7 +186,7 @@ class CalculationProcessor:
             
             # Save processed data
             if all_processed_data:
-                await self._save_processed_calculations(all_processed_data, time_control, year, month)
+                await self._save_processed_calculations(all_processed_data, time_control)
                 
             result = {
                 "status": "completed",
@@ -187,10 +203,9 @@ class CalculationProcessor:
             logger.error(f"Error processing time control {time_control}: {str(e)}")
             return {"status": "error", "error": str(e)}
 
-    async def _list_calculation_files(self, time_control: str, year: int, month: int) -> List[str]:
+    async def _list_calculation_files(self, time_control: str) -> List[str]:
         """List all calculation files for a time control from S3"""
-        month_str = f"{month:02d}"
-        prefix = f"persistent/calculations/{year}-{month_str}/{time_control}/"
+        prefix = f"persistent/calculations/{self.month_str}/{time_control}/"
         
         try:
             paginator = self.s3_client.get_paginator('list_objects_v2')
@@ -217,7 +232,7 @@ class CalculationProcessor:
         for page in page_iterator:
             yield await loop.run_in_executor(None, lambda: page)
 
-    async def _process_calculation_batch(self, file_keys: List[str], time_control: str, year: int, month: int) -> Tuple[List[Dict], List[str]]:
+    async def _process_calculation_batch(self, file_keys: List[str], time_control: str) -> Tuple[List[Dict], List[str]]:
         """Process a batch of calculation files"""
         processed_data = []
         failed_files = []
@@ -240,7 +255,7 @@ class CalculationProcessor:
                 player_id = file_key.split('/')[-1].replace('.json', '')
                 
                 # Process the calculation data
-                processed_calc = await self._process_single_calculation(result, player_id, time_control, year, month)
+                processed_calc = await self._process_single_calculation(result, player_id, time_control)
                 
                 if processed_calc:
                     processed_data.append(processed_calc)
@@ -266,14 +281,13 @@ class CalculationProcessor:
             logger.warning(f"Error downloading {s3_key}: {str(e)}")
             return None
 
-    async def _process_single_calculation(self, calculation_data: Dict, player_id: str, time_control: str, year: int, month: int) -> Optional[Dict]:
+    async def _process_single_calculation(self, calculation_data: Dict, player_id: str, time_control: str) -> Optional[Dict]:
         """Process a single player's calculation data into compact format"""
         try:
             if not calculation_data.get('tournaments'):
                 return None
             
             processed_games = []
-            month_str = f"{month:02d}"
             
             for tournament in calculation_data['tournaments']:
                 tournament_id = tournament.get('tournament_id', '')
@@ -291,8 +305,8 @@ class CalculationProcessor:
                         logger.warning(f"Invalid result: {result}")
                         continue  # Skip invalid results
                     
-                    # Try to get opponent ID from name
-                    opponent_id = self._get_player_id_from_name(opponent_name)
+                    # Try to get opponent ID from name using SQLite database
+                    opponent_id = await self._get_player_id_from_name(opponent_name, time_control)
                     
                     # Parse opponent rating
                     try:
@@ -301,32 +315,24 @@ class CalculationProcessor:
                         opponent_rating_int = None
                         
                     if not opponent_id:
-                        logger.warning(f"Could not resolve opponent ID for {opponent_name}; {tournament_id}, {player_id}. Downloading tournament data...")
-                        tournament_file = await self._download_calculation_file(f"persistent/tournament_data/processed/{time_control}/{year}-{month_str}/{tournament_id}.txt")
-                        if tournament_file:
-                            for line in tournament_file.strip().split('\n'):
-                                if line.strip():
-                                    try:
-                                        player_data = json.loads(line.strip())
-                                        if player_data.get('name', '').strip() == opponent_name:
-                                            opponent_id = player_data.get('id')
-                                            break
-                                    except json.JSONDecodeError:
-                                        continue
+                        logger.warning(f"Could not resolve opponent ID for '{opponent_name}' in tournament {tournament_id}, player {player_id}. Trying tournament data...")
+                        # Fallback: try to find opponent in tournament data
+                        opponent_id = await self._find_opponent_in_tournament_data(opponent_name, tournament_id, time_control)
                         
                     if not opponent_id:
-                        logger.warning(f"Could not resolve opponent ID for {opponent_name}; {tournament_id}, {player_id}")
-                    else:
-                        # Create compact game record
-                        game_record = {
-                            'tournament_id': tournament_id,
-                            'opponent_id': opponent_id,
-                            'opponent_rating': opponent_rating_int,
-                            'result': score,
-                            'player_unrated': is_unrated
-                        }
-                        
-                        processed_games.append(game_record)
+                        logger.warning(f"Could not resolve opponent ID for '{opponent_name}' in tournament {tournament_id}, player {player_id}")
+                        continue  # Skip this game if we can't resolve opponent
+                    
+                    # Create compact game record
+                    game_record = {
+                        'tournament_id': tournament_id,
+                        'opponent_id': opponent_id,
+                        'opponent_rating': opponent_rating_int,
+                        'result': score,
+                        'player_unrated': is_unrated
+                    }
+                    
+                    processed_games.append(game_record)
             
             if not processed_games:
                 return None
@@ -355,29 +361,93 @@ class CalculationProcessor:
             logger.warning(f"Unknown result format: {result}")
             return None
 
-    def _get_player_id_from_name(self, name: str) -> Optional[str]:
-        """Get player ID from name using the cache"""
-        if not name:
+    async def _get_player_id_from_name(self, name: str, time_control: str) -> Optional[str]:
+        """Get player ID from name using SQLite database"""
+        if not name or time_control not in self.db_connections:
             return None
         
-        # Normalize name for lookup
-        normalized_name = self._normalize_player_name(name)
-        
-        return self.name_to_id_cache.get(normalized_name)
+        try:
+            conn = self.db_connections[time_control]
+            cursor = conn.cursor()
+            
+            # Try exact match first (case-insensitive)
+            cursor.execute("SELECT id FROM players WHERE LOWER(name) = LOWER(?) LIMIT 1", (name,))
+            result = cursor.fetchone()
+            
+            if result:
+                return result[0]
+            
+            logger.warning(f"No exact match found for '{name}'")
+            # Try partial match if exact match fails
+            cursor.execute("SELECT id FROM players WHERE LOWER(name) LIKE LOWER(?) ORDER BY rating DESC LIMIT 1", (f"%{name}%",))
+            result = cursor.fetchone()
+            
+            if result:
+                logger.warning(f"Partial match found for '{name}'")
+                return result[0]
+            
+            logger.warning(f"No match found for '{name}'")
+            # Try normalized name matching
+            normalized_name = self._normalize_player_name(name)
+            if normalized_name:
+                cursor.execute("""
+                    SELECT id FROM players 
+                    WHERE LOWER(REPLACE(REPLACE(name, ',', ''), '.', '')) LIKE LOWER(?) 
+                    ORDER BY rating DESC LIMIT 1
+                """, (f"%{normalized_name}%",))
+                result = cursor.fetchone()
+                
+                if result:
+                    logger.warning(f"Normalized match found for '{name}'")
+                    return result[0]
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Error looking up player ID for '{name}': {str(e)}")
+            return None
 
-    async def _save_processed_calculations(self, processed_data: List[Dict], time_control: str, year: int, month: int):
+    async def _find_opponent_in_tournament_data(self, opponent_name: str, tournament_id: str, time_control: str) -> Optional[str]:
+        """Fallback method to find opponent in tournament data files"""
+        try:
+            # Try to download tournament data
+            tournament_s3_key = f"persistent/tournament_data/processed/{time_control}/{self.month_str}/{tournament_id}.txt"
+            
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.s3_client.get_object(Bucket=self.s3_bucket, Key=tournament_s3_key)
+            )
+            
+            content = response['Body'].read().decode('utf-8')
+            
+            # Parse tournament data to find opponent
+            for line in content.strip().split('\n'):
+                if line.strip():
+                    try:
+                        player_data = json.loads(line.strip())
+                        if player_data.get('name', '').strip().lower() == opponent_name.lower():
+                            return player_data.get('id')
+                    except json.JSONDecodeError:
+                        continue
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Could not find opponent '{opponent_name}' in tournament data for {tournament_id}: {str(e)}")
+            return None
+
+    async def _save_processed_calculations(self, processed_data: List[Dict], time_control: str):
         """Save processed calculation data to S3"""
-        month_str = f"{month:02d}"
         
         # Create local compressed file
-        local_file = os.path.join(self.local_temp_dir, f"calculations_processed_{year}-{month_str}_{time_control}.json.gz")
+        local_file = os.path.join(self.local_temp_dir, f"calculations_processed_{self.month_str}_{time_control}.json.gz")
         
         with gzip.open(local_file, 'wt', encoding='utf-8') as f:
             for record in processed_data:
                 f.write(json.dumps(record) + '\n')
         
         # Upload to S3
-        s3_key = f"persistent/calculations_processed/{year}-{month_str}_{time_control}.json.gz"
+        s3_key = f"persistent/calculations_processed/{self.month_str}_{time_control}.json.gz"
         await self._upload_to_s3_async(local_file, s3_key)
         
         # Cleanup local file
@@ -408,11 +478,11 @@ class CalculationProcessor:
             logger.error(f"Failed to upload to S3: {str(e)}")
             raise
 
-    async def _upload_processing_completion_marker(self, month_str: str, results: List[Tuple[str, Dict]]):
+    async def _upload_processing_completion_marker(self, results: List[Tuple[str, Dict]]):
         """Upload completion marker with processing statistics"""
         try:
             completion_data = {
-                "month": month_str,
+                "month": self.month_str,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "step": "calculation_processing",
                 "results": {}
@@ -435,18 +505,18 @@ class CalculationProcessor:
             }
             
             # Save locally first
-            local_file = os.path.join(self.local_temp_dir, f"calculation_processing_completion_{month_str}.json")
+            local_file = os.path.join(self.local_temp_dir, f"calculation_processing_completion_{self.month_str}.json")
             async with aiofiles.open(local_file, "w") as f:
                 await f.write(json.dumps(completion_data, indent=2))
             
             # Upload to S3
-            s3_key = f"results/{month_str}/calculation_processing_completion.json"
+            s3_key = f"results/{self.month_str}/calculation_processing_completion.json"
             await self._upload_to_s3_async(local_file, s3_key)
             
             # Cleanup
             os.remove(local_file)
             
-            logger.info(f"Uploaded processing completion marker for {month_str}")
+            logger.info(f"Uploaded processing completion marker for {self.month_str}")
             
         except Exception as e:
             logger.warning(f"Failed to upload processing completion marker: {str(e)}")
@@ -485,11 +555,12 @@ def main():
     # Initialize processor
     processor = CalculationProcessor(
         s3_bucket=args.s3_bucket,
-        aws_region=args.aws_region
+        aws_region=args.aws_region,
+        month_str=args.month
     )
     
     try:
-        success = asyncio.run(processor.process_calculations_for_month(args.month))
+        success = asyncio.run(processor.process_calculations_for_month())
         if success:
             logger.info(f"Calculation processing completed successfully for {args.month}")
             return 0
