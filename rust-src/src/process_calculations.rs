@@ -15,19 +15,7 @@ use rusqlite::{Connection, Result as SqliteResult};
 
 // Binary format constants
 const MAGIC_HEADER: &[u8; 8] = b"CHSSGAME";
-fn normalize_player_name(name: &str) -> String {
-    // Remove parentheses and content, extra spaces, lowercase, remove punctuation
-    let re = Regex::new(r"\([^)]*\)").unwrap();
-    let no_paren = re.replace_all(name, "");
-    no_paren
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-        .chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-        .collect()
-}
+
 const FORMAT_VERSION: u16 = 1;
 
 // Time controls
@@ -120,7 +108,7 @@ struct Game {
 }
 
 // Processing statistics
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 struct ProcessingStats {
     total_players: u32,
     processed_successfully: u32,
@@ -342,7 +330,7 @@ impl CalculationProcessor {
             
             match serde_json::from_str::<PlayerRecord>(&line) {
                 Ok(player_record) => {
-                    match self.process_single_calculation(&player_record, player_mappings) {
+                    match self.process_single_calculation(&player_record, player_mappings).await {
                         Ok(Some(processed_player)) => {
                             stats.total_games += processed_player.games.len() as u64;
                             processed_data.push(processed_player);
@@ -370,7 +358,7 @@ impl CalculationProcessor {
         Ok((processed_data, stats))
     }
 
-    fn process_single_calculation(&self, player_record: &PlayerRecord, player_mappings: &PlayerMappings) -> Result<Option<ProcessedPlayer>> {
+    async fn process_single_calculation(&self, player_record: &PlayerRecord, player_mappings: &PlayerMappings) -> Result<Option<ProcessedPlayer>> {
         let mut processed_games = Vec::new();
         
         for tournament in &player_record.calculation_data.tournaments {
@@ -384,14 +372,7 @@ impl CalculationProcessor {
                 }
                 
                 let score = self.convert_result_to_score(&game.result)?;
-                let mut opponent_id = self.get_player_id_from_name(opponent_name, player_mappings);
-                
-                // If we couldn't find the opponent, try the tournament database
-                if opponent_id.is_none() {
-                    if let Ok(Some(found_id)) = self.find_opponent_in_tournament_data(opponent_name, &tournament.tournament_id, "standard").await {
-                        opponent_id = Some(found_id);
-                    }
-                }
+                let opponent_id = self.get_player_id_from_name(opponent_name, player_mappings);
                 
                 let opponent_id_hash = match opponent_id {
                     Some(id) => self.hash_string(&id),
@@ -642,7 +623,7 @@ impl CalculationProcessor {
             "step": "calculation_processing",
             "input_format": "consolidated_jsonl",
             "output_format": "binary_packed",
-            "results": results.iter().collect::<HashMap<_, _>>()
+            "results": results.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()
         });
         
         let local_file = self.temp_dir.join(format!("calculation_processing_completion_{}.json", self.month_str));
