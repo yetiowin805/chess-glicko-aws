@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client as S3Client;
+use aws_types::region::Region;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -113,8 +114,8 @@ struct CalculationProcessor {
 
 impl CalculationProcessor {
     async fn new(s3_bucket: String, aws_region: String, month_str: String) -> Result<Self> {
-        let config = aws_config::defaults(BehaviorVersion::latest())
-            .region(aws_region)
+        let config = aws_config::from_env()
+            .region(Region::new(aws_region.clone()))
             .load()
             .await;
         
