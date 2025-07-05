@@ -6,9 +6,10 @@ import aiohttp
 import aiofiles
 import boto3
 import logging
+import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from botocore.exceptions import ClientError
 from bs4 import BeautifulSoup
 import re
@@ -31,6 +32,16 @@ class FIDETournamentScraper:
         # Semaphores for different levels of concurrency
         self.country_semaphore = asyncio.Semaphore(20)  # Max countries processed simultaneously
         self.tournament_semaphore = asyncio.Semaphore(50)  # Max tournaments processed simultaneously
+        
+        # Tournament data cache for building SQLite databases
+        self.tournament_data = {
+            "standard": [],
+            "rapid": [],
+            "blitz": []
+        }
+        
+        # Lock for thread-safe access to tournament_data
+        self.data_lock = asyncio.Lock()
         
         logger.info(f"Initialized tournament scraper - S3 bucket: {s3_bucket}, Region: {aws_region}")
         logger.info(f"Total countries to process: {len(countries)}")
@@ -63,6 +74,12 @@ class FIDETournamentScraper:
             
             # Setup local temp directory
             os.makedirs(self.local_temp_dir, exist_ok=True)
+            
+            # Check if SQLite databases already exist for all time controls
+            all_exist = await self._check_all_databases_exist(month_str)
+            if all_exist:
+                logger.info(f"All tournament databases already exist for {month_str}")
+                return True
             
             # Configure async session with higher limits for combined processing
             connector = aiohttp.TCPConnector(limit=200, limit_per_host=30)
@@ -98,6 +115,9 @@ class FIDETournamentScraper:
                 logger.info(f"Results - Countries: {len(successful)} successful, {len(skipped)} skipped, {len(failed)} failed")
                 logger.info(f"Total tournaments processed: {total_tournaments}")
                 
+                # Create and upload SQLite databases
+                await self._create_and_upload_databases(month_str)
+                
                 # Log failures for debugging
                 if failed:
                     logger.error(f"Failed countries: {[f[0] for f in failed[:10]]}")
@@ -112,6 +132,22 @@ class FIDETournamentScraper:
         except Exception as e:
             logger.error(f"Error in tournament processing: {str(e)}", exc_info=True)
             raise
+
+    async def _check_all_databases_exist(self, month_str: str) -> bool:
+        """Check if SQLite databases already exist for all time controls"""
+        year, month = map(int, month_str.split("-"))
+        
+        # Determine which time controls should exist based on year
+        time_controls_to_check = ["standard"]
+        if year >= 2012:
+            time_controls_to_check.extend(["rapid", "blitz"])
+        
+        for time_control in time_controls_to_check:
+            s3_key = f"persistent/tournament_data/processed/{time_control}/{month_str}.db"
+            if not await self._check_s3_file_exists_async(s3_key):
+                return False
+        
+        return True
 
     async def _process_country_tournaments(self, session: aiohttp.ClientSession, country: str, year: int, month: int):
         """Process all tournaments for a specific country - fetch tournament list then process each tournament"""
@@ -220,17 +256,8 @@ class FIDETournamentScraper:
             return []
 
     async def _process_single_tournament(self, session: aiohttp.ClientSession, tournament_id: str, country: str, year: int, month: int) -> bool:
-        """Process a single tournament and save player data"""
-        month_str = f"{month:02d}"
+        """Process a single tournament and add player data to cache"""
         url = f"{BASE_URL}/{TOURNAMENT_REPORT_PATH}{tournament_id}"
-        
-        # Check if already processed (check all time control directories)
-        s3_key_pattern = f"persistent/tournament_data/processed/{{}}/{year}-{month_str}/{tournament_id}.txt"
-        
-        for tc in ["standard", "rapid", "blitz"]:
-            s3_key = s3_key_pattern.format(tc)
-            if await self._check_s3_file_exists_async(s3_key):
-                return True  # Already processed
         
         max_retries = 3
         base_delay = 1
@@ -254,15 +281,14 @@ class FIDETournamentScraper:
                         time_control_dirs = {"0": "standard", "1": "rapid", "2": "blitz"}
                         tc_dir = time_control_dirs.get(time_control, "standard")
 
-                        # Save to local file first
-                        local_file = await self._save_tournament_locally(player_data, tournament_id, tc_dir, year, month)
-                        
-                        # Upload to S3
-                        s3_key = f"persistent/tournament_data/processed/{tc_dir}/{year}-{month_str}/{tournament_id}.txt"
-                        await self._upload_to_s3_async(local_file, s3_key)
-                        
-                        # Cleanup local file
-                        os.remove(local_file)
+                        # Add tournament data to cache (thread-safe)
+                        async with self.data_lock:
+                            for player_id, player_name in player_data:
+                                self.tournament_data[tc_dir].append({
+                                    'tournament_id': tournament_id,
+                                    'player_id': player_id,
+                                    'player_name': player_name
+                                })
                         
                         return True
 
@@ -313,20 +339,79 @@ class FIDETournamentScraper:
 
         return player_data, time_control
 
-    async def _save_tournament_locally(self, player_data: List[Tuple[str, str]], tournament_id: str, tc_dir: str, year: int, month: int) -> str:
-        """Save tournament player data to local file"""
-        month_str = f"{month:02d}"
-        local_dir = os.path.join(self.local_temp_dir, "processed_tournaments", tc_dir, f"{year}-{month_str}")
-        os.makedirs(local_dir, exist_ok=True)
+    async def _create_and_upload_databases(self, month_str: str):
+        """Create SQLite databases for each time control and upload to S3"""
+        year, month = map(int, month_str.split("-"))
         
-        local_file = os.path.join(local_dir, f"{tournament_id}.txt")
+        # Determine which time controls to create based on year
+        time_controls_to_create = ["standard"]
+        if year >= 2012:
+            time_controls_to_create.extend(["rapid", "blitz"])
         
-        async with aiofiles.open(local_file, "w", encoding="utf-8") as f:
-            for player_id, player_name in player_data:
-                player_record = {"id": player_id, "name": player_name}
-                await f.write(json.dumps(player_record) + "\n")
+        for time_control in time_controls_to_create:
+            if self.tournament_data[time_control]:
+                await self._create_time_control_database(time_control, month_str)
+            else:
+                logger.info(f"No data found for {time_control} time control")
+
+    async def _create_time_control_database(self, time_control: str, month_str: str):
+        """Create SQLite database for a specific time control"""
+        local_db_path = os.path.join(self.local_temp_dir, f"tournaments_{time_control}_{month_str}.db")
         
-        return local_file
+        try:
+            # Create SQLite database
+            conn = sqlite3.connect(local_db_path)
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            
+            # Create table
+            conn.execute('''
+                CREATE TABLE tournament_players (
+                    tournament_id TEXT NOT NULL,
+                    player_id TEXT NOT NULL,
+                    player_name TEXT NOT NULL,
+                    PRIMARY KEY (tournament_id, player_id)
+                )
+            ''')
+            
+            # Create indexes for fast lookups
+            conn.execute('CREATE INDEX idx_tournament_id ON tournament_players(tournament_id)')
+            conn.execute('CREATE INDEX idx_player_name ON tournament_players(LOWER(player_name))')
+            conn.execute('CREATE INDEX idx_tournament_name ON tournament_players(tournament_id, LOWER(player_name))')
+            
+            # Insert data in batches
+            batch_size = 1000
+            data_to_insert = [
+                (record['tournament_id'], record['player_id'], record['player_name'])
+                for record in self.tournament_data[time_control]
+            ]
+            
+            for i in range(0, len(data_to_insert), batch_size):
+                batch = data_to_insert[i:i + batch_size]
+                conn.executemany(
+                    'INSERT OR REPLACE INTO tournament_players (tournament_id, player_id, player_name) VALUES (?, ?, ?)',
+                    batch
+                )
+            
+            conn.commit()
+            conn.close()
+            
+            logger.info(f"Created {time_control} database with {len(data_to_insert)} records")
+            
+            # Upload to S3
+            s3_key = f"persistent/tournament_data/processed/{time_control}/{month_str}.db"
+            await self._upload_to_s3_async(local_db_path, s3_key)
+            
+            # Cleanup local file
+            os.remove(local_db_path)
+            
+            logger.info(f"Uploaded {time_control} database to {s3_key}")
+            
+        except Exception as e:
+            logger.error(f"Error creating database for {time_control}: {str(e)}")
+            if os.path.exists(local_db_path):
+                os.remove(local_db_path)
+            raise
 
     async def _check_s3_file_exists_async(self, s3_key: str) -> bool:
         """Async wrapper for checking S3 file existence"""
@@ -365,8 +450,13 @@ class FIDETournamentScraper:
                     "countries_skipped": skipped,
                     "total_tournaments_processed": total_tournaments
                 },
+                "database_info": {
+                    "standard_records": len(self.tournament_data["standard"]),
+                    "rapid_records": len(self.tournament_data["rapid"]),
+                    "blitz_records": len(self.tournament_data["blitz"])
+                },
                 "step": "combined_tournament_processing",
-                "method": "aiohttp_parallel"
+                "method": "aiohttp_parallel_sqlite"
             }
             
             local_file = os.path.join(self.local_temp_dir, f"tournament_processing_completion_{month_str}.json")
@@ -383,7 +473,7 @@ class FIDETournamentScraper:
             logger.warning(f"Failed to upload completion marker: {str(e)}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape and process FIDE tournament data in one step.")
+    parser = argparse.ArgumentParser(description="Scrape and process FIDE tournament data into SQLite databases.")
     parser.add_argument(
         "--month",
         type=str,

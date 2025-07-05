@@ -5,6 +5,7 @@ import asyncio
 import aiofiles
 import boto3
 import logging
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Set, List
@@ -28,9 +29,6 @@ class PlayerIDAggregator:
         self.player_sets = {}
         self.set_locks = {}
         
-        # Semaphore for controlling S3 download concurrency
-        self.download_semaphore = asyncio.Semaphore(20)
-        
         logger.info(f"Initialized player ID aggregator - S3 bucket: {s3_bucket}, Region: {aws_region}")
 
     async def aggregate_players_for_month(self, month_str):
@@ -42,8 +40,10 @@ class PlayerIDAggregator:
             # Setup local temp directory
             os.makedirs(self.local_temp_dir, exist_ok=True)
             
-            # Time control categories
-            time_controls = ["standard", "rapid", "blitz"]
+            # Determine which time controls to process based on year
+            time_controls = ["standard"]
+            if year >= 2012:
+                time_controls.extend(["rapid", "blitz"])
             
             # Initialize thread-safe sets and locks for each time control
             for tc in time_controls:
@@ -52,7 +52,7 @@ class PlayerIDAggregator:
             
             # Process each time control in parallel
             tasks = [
-                self._process_time_control(tc, year, month)
+                self._process_time_control(tc, month_str)
                 for tc in time_controls
             ]
             
@@ -75,7 +75,7 @@ class PlayerIDAggregator:
                     await self._save_player_list(tc, month_str, self.player_sets[tc])
                     
                 elif result == "skipped":
-                    logger.info(f"No tournaments found for {tc}")
+                    logger.info(f"No tournament database found for {tc}")
                 else:
                     failed.append((tc, str(result) if isinstance(result, Exception) else result))
             
@@ -98,123 +98,112 @@ class PlayerIDAggregator:
             logger.error(f"Error in player aggregation: {str(e)}", exc_info=True)
             raise
 
-    async def _process_time_control(self, time_control: str, year: int, month: int):
-        """Process all tournaments for a specific time control"""
-        month_str = f"{month:02d}"
-        
+    async def _process_time_control(self, time_control: str, month_str: str):
+        """Process tournament database for a specific time control"""
         try:
-            # List all tournament files for this time control and month
-            tournament_files = await self._list_tournament_files(time_control, year, month)
+            # Check if tournament database exists for this time control
+            s3_key = f"persistent/tournament_data/processed/{time_control}/{month_str}.db"
             
-            if not tournament_files:
-                logger.info(f"No tournament files found for {time_control} {year}-{month_str}")
+            if not await self._check_s3_file_exists_async(s3_key):
+                logger.info(f"No tournament database found for {time_control} {month_str}")
                 return "skipped"
             
-            logger.info(f"Found {len(tournament_files)} tournament files for {time_control}")
+            logger.info(f"Found tournament database for {time_control}, downloading and processing...")
             
-            # Process tournaments in chunks to manage memory and concurrency
-            chunk_size = 50  # Process 50 tournaments at a time
-            tournaments_processed = 0
+            # Download the SQLite database
+            local_db_path = await self._download_tournament_database(s3_key, time_control, month_str)
             
-            for i in range(0, len(tournament_files), chunk_size):
-                chunk = tournament_files[i:i + chunk_size]
-                
-                # Process this chunk of tournaments in parallel
-                tasks = [
-                    self._process_tournament_file(s3_key, time_control)
-                    for s3_key in chunk
-                ]
-                
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Count successful processes
-                successful_in_chunk = sum(1 for result in results if result is True)
-                tournaments_processed += successful_in_chunk
-                
-                logger.info(f"{time_control}: Processed {tournaments_processed}/{len(tournament_files)} tournaments, "
-                          f"{len(self.player_sets[time_control])} unique players found so far")
+            if not local_db_path:
+                logger.error(f"Failed to download tournament database for {time_control}")
+                return Exception(f"Failed to download database for {time_control}")
             
-            unique_player_count = len(self.player_sets[time_control])
-            logger.info(f"{time_control}: Completed processing {tournaments_processed} tournaments, "
-                       f"found {unique_player_count} unique players")
+            # Extract player IDs from the database
+            player_count = await self._extract_player_ids_from_database(local_db_path, time_control)
             
-            return ("success", unique_player_count)
+            # Clean up local database file
+            if os.path.exists(local_db_path):
+                os.remove(local_db_path)
+            
+            logger.info(f"{time_control}: Found {player_count} unique players")
+            
+            return ("success", player_count)
             
         except Exception as e:
             logger.error(f"Error processing time control {time_control}: {str(e)}")
             return e
 
-    async def _list_tournament_files(self, time_control: str, year: int, month: int) -> List[str]:
-        """List all tournament files for a specific time control and month from S3"""
-        month_str = f"{month:02d}"
-        prefix = f"persistent/tournament_data/processed/{time_control}/{year}-{month_str}/"
+    async def _check_s3_file_exists_async(self, s3_key: str) -> bool:
+        """Async wrapper for checking S3 file existence"""
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(
+                None, 
+                lambda: self.s3_client.head_object(Bucket=self.s3_bucket, Key=s3_key)
+            )
+            return True
+        except ClientError:
+            return False
+
+    async def _download_tournament_database(self, s3_key: str, time_control: str, month_str: str) -> str:
+        """Download tournament SQLite database from S3"""
+        local_db_path = os.path.join(self.local_temp_dir, f"tournaments_{time_control}_{month_str}.db")
         
         try:
             loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: self.s3_client.download_file(self.s3_bucket, s3_key, local_db_path)
+            )
             
-            # Use paginator to handle large numbers of files
-            paginator = self.s3_client.get_paginator('list_objects_v2')
-            page_iterator = paginator.paginate(Bucket=self.s3_bucket, Prefix=prefix)
-            
-            tournament_files = []
-            
-            # Run pagination in executor to avoid blocking
-            for page in await loop.run_in_executor(None, lambda: list(page_iterator)):
-                if 'Contents' in page:
-                    for obj in page['Contents']:
-                        key = obj['Key']
-                        if key.endswith('.txt'):
-                            tournament_files.append(key)
-            
-            return tournament_files
+            logger.info(f"Downloaded tournament database for {time_control}")
+            return local_db_path
             
         except ClientError as e:
-            logger.error(f"Error listing tournament files for {time_control}: {str(e)}")
-            return []
+            logger.error(f"Error downloading tournament database {s3_key}: {str(e)}")
+            return None
         except Exception as e:
-            logger.error(f"Unexpected error listing tournament files for {time_control}: {str(e)}")
-            return []
+            logger.error(f"Unexpected error downloading tournament database {s3_key}: {str(e)}")
+            return None
 
-    async def _process_tournament_file(self, s3_key: str, time_control: str) -> bool:
-        """Download and process a single tournament file"""
+    async def _extract_player_ids_from_database(self, db_path: str, time_control: str) -> int:
+        """Extract unique player IDs from tournament SQLite database"""
         try:
-            async with self.download_semaphore:
-                # Download tournament file from S3
-                loop = asyncio.get_event_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: self.s3_client.get_object(Bucket=self.s3_bucket, Key=s3_key)
-                )
+            loop = asyncio.get_event_loop()
+            
+            # Run database query in executor to avoid blocking
+            def query_database():
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
                 
-                content = response['Body'].read().decode('utf-8')
+                # Get all unique player IDs from the database
+                cursor.execute("SELECT DISTINCT player_id FROM tournament_players")
+                player_ids = {row[0] for row in cursor.fetchall()}
                 
-                # Parse player IDs from the file
-                player_ids = set()
-                for line in content.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    
-                    try:
-                        player_data = json.loads(line)
-                        if "id" in player_data:
-                            player_ids.add(player_data["id"])
-                    except json.JSONDecodeError:
-                        logger.warning(f"Invalid JSON in {s3_key}: {line}")
-                        continue
+                # Get some statistics for logging
+                cursor.execute("SELECT COUNT(*) FROM tournament_players")
+                total_records = cursor.fetchone()[0]
                 
-                # Thread-safe addition to the global set for this time control
-                with self.set_locks[time_control]:
-                    self.player_sets[time_control].update(player_ids)
+                cursor.execute("SELECT COUNT(DISTINCT tournament_id) FROM tournament_players")
+                unique_tournaments = cursor.fetchone()[0]
                 
-                return True
+                conn.close()
                 
-        except ClientError as e:
-            logger.warning(f"Error downloading {s3_key}: {str(e)}")
-            return False
+                logger.info(f"{time_control}: Database contains {total_records} records across {unique_tournaments} tournaments")
+                
+                return player_ids
+            
+            # Execute database query
+            player_ids = await loop.run_in_executor(None, query_database)
+            
+            # Thread-safe addition to the global set for this time control
+            with self.set_locks[time_control]:
+                self.player_sets[time_control].update(player_ids)
+            
+            return len(player_ids)
+            
         except Exception as e:
-            logger.error(f"Unexpected error processing {s3_key}: {str(e)}")
-            return False
+            logger.error(f"Error extracting player IDs from database {db_path}: {str(e)}")
+            raise
 
     async def _save_player_list(self, time_control: str, month_str: str, player_ids: Set[str]):
         """Save aggregated player list to local file and upload to S3"""
@@ -273,7 +262,7 @@ class PlayerIDAggregator:
                     "details": {tc: count for tc, count in success_details}
                 },
                 "step": "player_aggregation",
-                "method": "parallel_s3"
+                "method": "sqlite_database"
             }
             
             local_file = os.path.join(self.local_temp_dir, f"player_aggregation_completion_{month_str}.json")
@@ -290,7 +279,7 @@ class PlayerIDAggregator:
             logger.warning(f"Failed to upload completion marker: {str(e)}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Aggregate player IDs from processed tournament files.")
+    parser = argparse.ArgumentParser(description="Aggregate player IDs from processed tournament databases.")
     parser.add_argument(
         "--month",
         type=str,

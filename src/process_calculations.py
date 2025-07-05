@@ -137,6 +137,17 @@ class CalculationProcessor:
         """Close all database connections and cleanup files"""
         for time_control in list(self.db_connections.keys()):
             await self._close_database_connection(time_control)
+        
+        # Also cleanup tournament database cache
+        if hasattr(self, '_tournament_db_cache'):
+            for cache_key, local_path in self._tournament_db_cache.items():
+                try:
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                        logger.debug(f"Cleaned up cached tournament database: {local_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup tournament database {local_path}: {str(e)}")
+            self._tournament_db_cache.clear()
 
     def _normalize_player_name(self, name: str) -> str:
         """Normalize player name: remove parenthesis and content, extra spaces, lowercase, remove punctuation."""
@@ -398,7 +409,6 @@ class CalculationProcessor:
                 result = cursor.fetchone()
                 
                 if result:
-                    logger.warning(f"Normalized match found for '{name}'")
                     return result[0]
             
             return None
@@ -408,32 +418,86 @@ class CalculationProcessor:
             return None
 
     async def _find_opponent_in_tournament_data(self, opponent_name: str, tournament_id: str, time_control: str) -> Optional[str]:
-        """Fallback method to find opponent in tournament data files"""
+        """Fallback method to find opponent in tournament SQLite database"""
         try:
-            # Try to download tournament data
-            tournament_s3_key = f"persistent/tournament_data/processed/{time_control}/{self.month_str}/{tournament_id}.txt"
+            # Download tournament database if not already cached
+            tournament_db_path = await self._get_tournament_database(time_control)
             
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.s3_client.get_object(Bucket=self.s3_bucket, Key=tournament_s3_key)
-            )
+            if not tournament_db_path:
+                logger.debug(f"Could not access tournament database for {time_control}")
+                return None
             
-            content = response['Body'].read().decode('utf-8')
+            # Query the tournament database for this specific tournament and opponent name
+            conn = sqlite3.connect(tournament_db_path)
+            cursor = conn.cursor()
             
-            # Parse tournament data to find opponent
-            for line in content.strip().split('\n'):
-                if line.strip():
-                    try:
-                        player_data = json.loads(line.strip())
-                        if player_data.get('name', '').strip().lower() == opponent_name.lower():
-                            return player_data.get('id')
-                    except json.JSONDecodeError:
-                        continue
+            # Try exact match first (case-insensitive)
+            cursor.execute("""
+                SELECT player_id FROM tournament_players 
+                WHERE tournament_id = ? AND LOWER(player_name) = LOWER(?)
+                LIMIT 1
+            """, (tournament_id, opponent_name))
             
+            result = cursor.fetchone()
+            if result:
+                conn.close()
+                logger.debug(f"Found opponent '{opponent_name}' in tournament {tournament_id} via exact match")
+                return result[0]
+            
+            logger.warning(f"No exact match found for '{opponent_name}' in tournament {tournament_id}")
+            # Try partial match if exact match fails
+            cursor.execute("""
+                SELECT player_id FROM tournament_players 
+                WHERE tournament_id = ? AND LOWER(player_name) LIKE LOWER(?)
+                LIMIT 1
+            """, (tournament_id, f"%{opponent_name}%"))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                logger.debug(f"Found opponent '{opponent_name}' in tournament {tournament_id} via partial match")
+                return result[0]
+            
+            logger.warning(f"No match found for '{opponent_name}' in tournament {tournament_id}")
             return None
             
         except Exception as e:
-            logger.debug(f"Could not find opponent '{opponent_name}' in tournament data for {tournament_id}: {str(e)}")
+            logger.debug(f"Could not find opponent '{opponent_name}' in tournament database for {tournament_id}: {str(e)}")
+            return None
+
+    async def _get_tournament_database(self, time_control: str) -> Optional[str]:
+        """Download and cache tournament database for fallback lookups"""
+        cache_key = f"tournament_{time_control}"
+        
+        # Check if already cached
+        if hasattr(self, '_tournament_db_cache') and cache_key in self._tournament_db_cache:
+            local_path = self._tournament_db_cache[cache_key]
+            if os.path.exists(local_path):
+                return local_path
+        
+        # Initialize cache if not exists
+        if not hasattr(self, '_tournament_db_cache'):
+            self._tournament_db_cache = {}
+        
+        # Download tournament database
+        s3_key = f"persistent/tournament_data/processed/{time_control}/{self.month_str}.db"
+        local_path = os.path.join(self.local_temp_dir, f"tournaments_{time_control}_{self.month_str}.db")
+        
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.s3_client.download_file(self.s3_bucket, s3_key, local_path)
+            )
+            
+            # Cache the path
+            self._tournament_db_cache[cache_key] = local_path
+            logger.debug(f"Downloaded and cached tournament database for {time_control}")
+            
+            return local_path
+            
+        except ClientError as e:
+            logger.debug(f"Failed to download tournament database {s3_key}: {str(e)}")
             return None
 
     async def _save_processed_calculations(self, processed_data: List[Dict], time_control: str):
