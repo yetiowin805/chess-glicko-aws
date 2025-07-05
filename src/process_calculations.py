@@ -388,16 +388,14 @@ class CalculationProcessor:
             if result:
                 return result[0]
             
-            logger.warning(f"No exact match found for '{name}'")
             # Try partial match if exact match fails
             cursor.execute("SELECT id FROM players WHERE LOWER(name) LIKE LOWER(?) ORDER BY rating DESC LIMIT 1", (f"%{name}%",))
             result = cursor.fetchone()
             
             if result:
-                logger.warning(f"Partial match found for '{name}'")
+                logger.warning(f"Partial match found for '{name}': {result[0]}")
                 return result[0]
             
-            logger.warning(f"No match found for '{name}'")
             # Try normalized name matching
             normalized_name = self._normalize_player_name(name)
             if normalized_name:
@@ -456,7 +454,7 @@ class CalculationProcessor:
             conn.close()
             
             if result:
-                logger.debug(f"Found opponent '{opponent_name}' in tournament {tournament_id} via partial match")
+                logger.debug(f"Found opponent '{opponent_name}' in tournament {tournament_id} via partial match: {result[0]}")
                 return result[0]
             
             logger.warning(f"No match found for '{opponent_name}' in tournament {tournament_id}")
