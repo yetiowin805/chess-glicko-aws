@@ -5,7 +5,11 @@ edition = "2021"
 
 [[bin]]
 name = "calculation-scraper"
-path = "src/calculation_processor.rs"
+path = "src/scrape_calculations.rs"
+
+[[bin]]
+name = "calculation-processor"
+path = "src/process_calculations.rs"
 
 [dependencies]
 # Async runtime
