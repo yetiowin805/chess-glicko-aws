@@ -14,11 +14,11 @@ on:
       task_cpu:
         description: 'CPU units (1024 = 1 vCPU)'
         required: false
-        default: '2048'
+        default: '1024'
       task_memory:
         description: 'Memory in MiB'
         required: false
-        default: '512'
+        default: '2048'
       pipeline_mode:
         description: 'Pipeline mode to run'
         required: false
