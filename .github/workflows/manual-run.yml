@@ -6,11 +6,11 @@ on:
       first_month:
         description: 'First month to process (YYYY-MM format)'
         required: true
-        default: '2024-01'
+        default: '2024-07'
       last_month:
         description: 'Last month to process (YYYY-MM format)'
         required: true
-        default: '2024-01'
+        default: '2024-07'
       task_cpu:
         description: 'CPU units (1024 = 1 vCPU)'
         required: false
@@ -72,15 +72,25 @@ jobs:
         
         echo "Processing from $FIRST_MONTH to $LAST_MONTH"
         
+        # Convert dates to comparable format (YYYYMM)
+        FIRST_NUMERIC=$(echo $FIRST_MONTH | tr -d '-')
+        LAST_NUMERIC=$(echo $LAST_MONTH | tr -d '-')
+        
         # Generate list of months
         MONTHS=""
         CURRENT_MONTH="$FIRST_MONTH"
+        CURRENT_NUMERIC="$FIRST_NUMERIC"
         
-        while [[ "$CURRENT_MONTH" <= "$LAST_MONTH" ]]; do
+        while [[ $CURRENT_NUMERIC -le $LAST_NUMERIC ]]; do
           if [[ -n "$MONTHS" ]]; then
             MONTHS="$MONTHS $CURRENT_MONTH"
           else
             MONTHS="$CURRENT_MONTH"
+          fi
+          
+          # Break if we've reached the last month
+          if [[ "$CURRENT_MONTH" == "$LAST_MONTH" ]]; then
+            break
           fi
           
           # Calculate next month
@@ -98,6 +108,7 @@ jobs:
           
           # Format next month
           CURRENT_MONTH=$(printf "%04d-%02d" $YEAR $MONTH)
+          CURRENT_NUMERIC=$(echo $CURRENT_MONTH | tr -d '-')
         done
         
         echo "months=$MONTHS" >> $GITHUB_OUTPUT
