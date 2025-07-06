@@ -219,3 +219,33 @@ jobs:
           echo "Task ARN: '$TASK_ARN'"
           exit 1
         fi
+
+    - name: Monitor Resource Usage
+      env:
+        CLUSTER_NAME: ${{ steps.infra.outputs.cluster_name }}
+      run: |
+        echo "=== Monitoring Resource Usage ==="
+        
+        # Wait for task to start
+        sleep 30
+        
+        # Get current resource utilization
+        aws cloudwatch get-metric-statistics \
+          --namespace AWS/ECS \
+          --metric-name CPUUtilization \
+          --dimensions Name=ClusterName,Value=$CLUSTER_NAME \
+          --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+          --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+          --period 60 \
+          --statistics Average,Maximum \
+          --output table
+        
+        aws cloudwatch get-metric-statistics \
+          --namespace AWS/ECS \
+          --metric-name MemoryUtilization \
+          --dimensions Name=ClusterName,Value=$CLUSTER_NAME \
+          --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+          --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+          --period 60 \
+          --statistics Average,Maximum \
+          --output table
