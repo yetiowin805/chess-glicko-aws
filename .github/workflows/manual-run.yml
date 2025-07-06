@@ -15,6 +15,14 @@ on:
         description: 'Memory in MiB'
         required: false
         default: '2048'
+      pipeline_mode:
+        description: 'Pipeline mode to run'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+        - 'full'
+        - 'post_scraping'
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
@@ -42,11 +50,19 @@ jobs:
     - name: Get Infrastructure Details
       id: infra
       run: |
+        echo "=== Getting Infrastructure Details ==="
+        
         # Get cluster name
         CLUSTER_NAME=$(aws ecs list-clusters \
           --query "clusterArns[?contains(@, '${{ env.PROJECT_NAME }}')]" \
           --output text | cut -d'/' -f2)
+        
+        if [ -z "$CLUSTER_NAME" ]; then
+          echo "⚠️  No cluster found with project name, using default: chess-glicko-cluster"
+          CLUSTER_NAME="chess-glicko-cluster"
+        fi
         echo "cluster_name=$CLUSTER_NAME" >> $GITHUB_OUTPUT
+        echo "Using cluster: $CLUSTER_NAME"
         
         # Get task definition
         TASK_DEF=$(aws ecs list-task-definitions \
@@ -55,30 +71,88 @@ jobs:
           --max-items 1 \
           --query 'taskDefinitionArns[0]' \
           --output text | cut -d'/' -f2 | cut -d':' -f1)
-        echo "task_definition=$TASK_DEF" >> $GITHUB_OUTPUT
         
-        # Get default subnet
-        SUBNET_ID=$(aws ec2 describe-subnets \
-          --filters "Name=default-for-az,Values=true" \
-          --query 'Subnets[0].SubnetId' \
-          --output text)
-        echo "subnet_id=$SUBNET_ID" >> $GITHUB_OUTPUT
+        if [ -z "$TASK_DEF" ] || [ "$TASK_DEF" = "None" ]; then
+          echo "⚠️  No task definition found with project name, using default: chess-glicko-task"
+          TASK_DEF="chess-glicko-task"
+        fi
+        echo "task_definition=$TASK_DEF" >> $GITHUB_OUTPUT
+        echo "Using task definition: $TASK_DEF"
+        
+        # Get S3 bucket name
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        S3_BUCKET_NAME="${{ env.PROJECT_NAME }}-data-$ACCOUNT_ID"
+        echo "s3_bucket_name=$S3_BUCKET_NAME" >> $GITHUB_OUTPUT
+        echo "Using S3 bucket: $S3_BUCKET_NAME"
+        
+        # Get network configuration - multiple subnets for better availability
+        SUBNET_IDS=$(aws ec2 describe-subnets \
+          --filters "Name=vpc-id,Values=$(aws ec2 describe-vpcs --filters 'Name=isDefault,Values=true' --query 'Vpcs[0].VpcId' --output text)" \
+          --query 'Subnets[0:3].SubnetId' \
+          --output text | tr '\t' ',')
+        echo "subnet_ids=$SUBNET_IDS" >> $GITHUB_OUTPUT
+        echo "Using subnets: $SUBNET_IDS"
+        
+        # Get security group
+        SG_ID=$(aws ec2 describe-security-groups \
+          --filters "Name=group-name,Values=chess-glicko-ecs-tasks" \
+          --query 'SecurityGroups[0].GroupId' \
+          --output text 2>/dev/null || echo "")
+        
+        if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=default" \
+            --query 'SecurityGroups[0].GroupId' \
+            --output text)
+          echo "⚠️  Using default security group: $SG_ID"
+        else
+          echo "Using project security group: $SG_ID"
+        fi
+        echo "security_group_id=$SG_ID" >> $GITHUB_OUTPUT
 
     - name: Run Pipeline Task
       env:
         CLUSTER_NAME: ${{ steps.infra.outputs.cluster_name }}
         TASK_DEFINITION: ${{ steps.infra.outputs.task_definition }}
-        SUBNET_ID: ${{ steps.infra.outputs.subnet_id }}
+        S3_BUCKET_NAME: ${{ steps.infra.outputs.s3_bucket_name }}
+        SUBNET_IDS: ${{ steps.infra.outputs.subnet_ids }}
+        SECURITY_GROUP_ID: ${{ steps.infra.outputs.security_group_id }}
       run: |
-        echo "Running pipeline for month: ${{ github.event.inputs.month }}"
-        echo "Using cluster: $CLUSTER_NAME"
-        echo "Using task definition: $TASK_DEFINITION"
+        echo "=== Running ${{ github.event.inputs.pipeline_mode }} Pipeline ==="
+        echo "Month: ${{ github.event.inputs.month }}"
+        echo "Mode: ${{ github.event.inputs.pipeline_mode }}"
+        echo "CPU: ${{ github.event.inputs.task_cpu }}"
+        echo "Memory: ${{ github.event.inputs.task_memory }}"
+        echo "Cluster: $CLUSTER_NAME"
+        echo "Task Definition: $TASK_DEFINITION"
+        echo "S3 Bucket: $S3_BUCKET_NAME"
+        echo "Subnets: $SUBNET_IDS"
+        echo "Security Group: $SECURITY_GROUP_ID"
         
+        # Prepare pipeline mode description
+        if [ "${{ github.event.inputs.pipeline_mode }}" = "full" ]; then
+          echo "📊 Full pipeline will run all steps:"
+          echo "  - Download data archives"
+          echo "  - Extract and process games"
+          echo "  - Calculate Glicko ratings"
+          echo "  - Upload results to S3"
+          echo "  ⚠️  Expected duration: 15-20 minutes"
+        else
+          echo "📊 Post-scraping pipeline will run:"
+          echo "  - Process calculation data"
+          echo "  - Calculate Glicko ratings"
+          echo "  - Upload results to S3"
+          echo "  ⚠️  Expected duration: 2-5 minutes"
+        fi
+        echo ""
+        
+        # Run the task
+        echo "Starting pipeline task..."
         TASK_ARN=$(aws ecs run-task \
           --cluster $CLUSTER_NAME \
           --task-definition $TASK_DEFINITION \
           --launch-type FARGATE \
-          --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_ID],assignPublicIp=ENABLED}" \
+          --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],assignPublicIp=ENABLED,securityGroups=[$SECURITY_GROUP_ID]}" \
           --overrides "{
             \"taskRoleArn\": \"$(aws ecs describe-task-definition --task-definition $TASK_DEFINITION --query 'taskDefinition.taskRoleArn' --output text)\",
             \"cpu\": \"${{ github.event.inputs.task_cpu }}\",
@@ -88,19 +162,60 @@ jobs:
               \"environment\": [{
                 \"name\": \"PROCESS_MONTH\",
                 \"value\": \"${{ github.event.inputs.month }}\"
+              }, {
+                \"name\": \"PIPELINE_MODE\",
+                \"value\": \"${{ github.event.inputs.pipeline_mode }}\"
+              }, {
+                \"name\": \"S3_BUCKET\",
+                \"value\": \"$S3_BUCKET_NAME\"
               }]
             }]
           }" \
           --query 'tasks[0].taskArn' \
           --output text)
         
-        echo "✅ Pipeline task started successfully!"
-        echo "Task ARN: $TASK_ARN"
-        echo ""
-        echo "📊 Monitor progress:"
-        echo "  - Task status: aws ecs describe-tasks --cluster $CLUSTER_NAME --tasks $TASK_ARN"
-        echo "  - Logs: aws logs tail /ecs/${{ env.PROJECT_NAME }} --follow"
-        echo ""
-        echo "🔗 AWS Console Links:"
-        echo "  - ECS Task: https://console.aws.amazon.com/ecs/home?region=${{ env.AWS_REGION }}#/clusters/$CLUSTER_NAME/tasks"
-        echo "  - CloudWatch Logs: https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/%2Fecs%2F${{ env.PROJECT_NAME }}"
+        if [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
+          echo "✅ Pipeline task started successfully!"
+          echo "Task ARN: $TASK_ARN"
+          echo ""
+          
+          # Wait and check initial status
+          echo "⏳ Checking initial task status..."
+          sleep 15
+          TASK_STATUS=$(aws ecs describe-tasks \
+            --cluster "$CLUSTER_NAME" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].lastStatus' \
+            --output text)
+          echo "Task status after 15 seconds: $TASK_STATUS"
+          
+          # Check if task failed to start
+          if [ "$TASK_STATUS" = "STOPPED" ]; then
+            echo "❌ Task stopped unexpectedly. Checking for errors..."
+            aws ecs describe-tasks \
+              --cluster "$CLUSTER_NAME" \
+              --tasks "$TASK_ARN" \
+              --query 'tasks[0].stoppedReason' \
+              --output text
+            exit 1
+          fi
+          
+          echo ""
+          echo "📊 Monitor progress:"
+          echo "  - Task status: aws ecs describe-tasks --cluster $CLUSTER_NAME --tasks $TASK_ARN"
+          echo "  - Logs: aws logs tail /ecs/${{ env.PROJECT_NAME }} --follow"
+          echo ""
+          echo "🔗 AWS Console Links:"
+          echo "  - ECS Task: https://console.aws.amazon.com/ecs/home?region=${{ env.AWS_REGION }}#/clusters/$CLUSTER_NAME/tasks"
+          echo "  - CloudWatch Logs: https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/%2Fecs%2F${{ env.PROJECT_NAME }}"
+          echo ""
+          if [ "${{ github.event.inputs.pipeline_mode }}" = "full" ]; then
+            echo "💡 Full pipeline typically takes 15-20 minutes. Check logs for progress updates."
+          else
+            echo "💡 Post-scraping pipeline typically takes 2-5 minutes. Check logs for progress updates."
+          fi
+        else
+          echo "❌ Failed to start pipeline task"
+          echo "Task ARN: '$TASK_ARN'"
+          exit 1
+        fi
