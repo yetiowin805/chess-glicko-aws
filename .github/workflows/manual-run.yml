@@ -6,11 +6,11 @@ on:
       first_month:
         description: 'First month to process (YYYY-MM format)'
         required: true
-        default: '2024-07'
+        default: '2025-07'
       last_month:
         description: 'Last month to process (YYYY-MM format)'
         required: true
-        default: '2024-07'
+        default: '2025-07'
       task_cpu:
         description: 'CPU units (1024 = 1 vCPU)'
         required: false
@@ -375,7 +375,7 @@ jobs:
         echo ""
         
         # Calculate monitoring time window (add 10 minutes buffer)
-        START_TIME=$(date -u -d "$PIPELINE_START_TIME - 10 minutes" +%Y-%m-%dT%H:%M:%S)
+        START_TIME=$(date -u -d "@$(($(date -u -d "$PIPELINE_START_TIME" +%s) - 600))" +%Y-%m-%dT%H:%M:%S)
         END_TIME=$(date -u +%Y-%m-%dT%H:%M:%S)
         
         echo "📊 Monitoring time window: $START_TIME to $END_TIME"
