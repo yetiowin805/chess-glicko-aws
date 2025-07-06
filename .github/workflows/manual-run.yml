@@ -183,6 +183,7 @@ jobs:
         echo "security_group_id=$SG_ID" >> $GITHUB_OUTPUT
 
     - name: Run Pipeline for Each Month
+      id: pipeline_run
       env:
         CLUSTER_NAME: ${{ steps.infra.outputs.cluster_name }}
         TASK_DEFINITION: ${{ steps.infra.outputs.task_definition }}
@@ -204,6 +205,10 @@ jobs:
         echo "Subnets: $SUBNET_IDS"
         echo "Security Group: $SECURITY_GROUP_ID"
         echo ""
+        
+        # Store pipeline start time for monitoring
+        PIPELINE_START_TIME=$(date -u +%Y-%m-%dT%H:%M:%S)
+        echo "pipeline_start_time=$PIPELINE_START_TIME" >> $GITHUB_OUTPUT
         
         # Prepare pipeline mode description
         if [ "${{ github.event.inputs.pipeline_mode }}" = "full" ]; then
@@ -231,6 +236,7 @@ jobs:
         SUCCESSFUL_MONTHS=""
         FAILED_MONTHS=""
         CURRENT_MONTH_NUM=1
+        ALL_TASK_ARNS=""
         
         # Process each month
         for MONTH in $MONTHS; do
@@ -270,10 +276,13 @@ jobs:
             echo "✅ Pipeline task started successfully for $MONTH!"
             echo "Task ARN: $TASK_ARN"
             
-            # Wait for task to complete
+            # Store task ARN for monitoring
+            ALL_TASK_ARNS="$ALL_TASK_ARNS $TASK_ARN"
+            
+            # Wait for task to complete - increased to 1 hour (3600 seconds)
             echo "⏳ Waiting for task to complete..."
             TASK_STATUS="RUNNING"
-            MAX_WAIT_TIME=1800  # 30 minutes max wait
+            MAX_WAIT_TIME=3600  # 1 hour max wait
             WAIT_TIME=0
             
             while [[ "$TASK_STATUS" != "STOPPED" && $WAIT_TIME -lt $MAX_WAIT_TIME ]]; do
@@ -285,7 +294,7 @@ jobs:
                 --query 'tasks[0].lastStatus' \
                 --output text 2>/dev/null || echo "UNKNOWN")
               
-              if [[ $((WAIT_TIME % 180)) -eq 0 ]]; then  # Log every 3 minutes
+              if [[ $((WAIT_TIME % 300)) -eq 0 ]]; then  # Log every 5 minutes
                 echo "⏳ Task still running after $((WAIT_TIME / 60)) minutes... (Status: $TASK_STATUS)"
               fi
             done
@@ -325,6 +334,11 @@ jobs:
           echo ""
         done
         
+        # Store results for monitoring
+        echo "task_arns=$ALL_TASK_ARNS" >> $GITHUB_OUTPUT
+        echo "successful_months=$SUCCESSFUL_MONTHS" >> $GITHUB_OUTPUT
+        echo "failed_months=$FAILED_MONTHS" >> $GITHUB_OUTPUT
+        
         echo "=================================="
         echo "📊 FINAL RESULTS"
         echo "=================================="
@@ -346,33 +360,194 @@ jobs:
           echo "🎉 All months processed successfully!"
         fi
 
-    - name: Monitor Overall Resource Usage
+    - name: Monitor Resource Usage and Performance
       if: always()
       env:
         CLUSTER_NAME: ${{ steps.infra.outputs.cluster_name }}
+        TASK_DEFINITION: ${{ steps.infra.outputs.task_definition }}
+        PIPELINE_START_TIME: ${{ steps.pipeline_run.outputs.pipeline_start_time }}
+        TASK_ARNS: ${{ steps.pipeline_run.outputs.task_arns }}
+        SUCCESSFUL_MONTHS: ${{ steps.pipeline_run.outputs.successful_months }}
+        FAILED_MONTHS: ${{ steps.pipeline_run.outputs.failed_months }}
       run: |
-        echo "=== Overall Resource Usage Summary ==="
+        echo "=== Resource Usage and Performance Monitoring ==="
+        echo "Pipeline run period: $PIPELINE_START_TIME to $(date -u +%Y-%m-%dT%H:%M:%S)"
+        echo ""
         
-        # Get resource utilization for the last hour
-        echo "📊 CPU Utilization:"
-        aws cloudwatch get-metric-statistics \
+        # Calculate monitoring time window (add 10 minutes buffer)
+        START_TIME=$(date -u -d "$PIPELINE_START_TIME - 10 minutes" +%Y-%m-%dT%H:%M:%S)
+        END_TIME=$(date -u +%Y-%m-%dT%H:%M:%S)
+        
+        echo "📊 Monitoring time window: $START_TIME to $END_TIME"
+        echo ""
+        
+        # Monitor cluster-level metrics
+        echo "🖥️  CLUSTER METRICS"
+        echo "==================="
+        
+        # CPU Utilization
+        echo "📈 CPU Utilization (%):"
+        CPU_STATS=$(aws cloudwatch get-metric-statistics \
           --namespace AWS/ECS \
           --metric-name CPUUtilization \
           --dimensions Name=ClusterName,Value=$CLUSTER_NAME \
-          --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
-          --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+          --start-time "$START_TIME" \
+          --end-time "$END_TIME" \
           --period 300 \
-          --statistics Average Maximum \
-          --output table || echo "No CPU metrics available"
+          --statistics Average,Maximum,Minimum \
+          --query 'Datapoints[*].[Timestamp,Average,Maximum,Minimum]' \
+          --output text 2>/dev/null)
         
+        if [ -n "$CPU_STATS" ]; then
+          echo "$CPU_STATS" | sort | tail -10 | while read timestamp avg max min; do
+            printf "  %s: Avg=%.1f%%, Max=%.1f%%, Min=%.1f%%\n" "$(date -d "$timestamp" '+%H:%M:%S')" "$avg" "$max" "$min"
+          done
+        else
+          echo "  No CPU metrics available for the specified time range"
+        fi
         echo ""
-        echo "📊 Memory Utilization:"
-        aws cloudwatch get-metric-statistics \
+        
+        # Memory Utilization
+        echo "💾 Memory Utilization (%):"
+        MEMORY_STATS=$(aws cloudwatch get-metric-statistics \
           --namespace AWS/ECS \
           --metric-name MemoryUtilization \
           --dimensions Name=ClusterName,Value=$CLUSTER_NAME \
-          --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
-          --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+          --start-time "$START_TIME" \
+          --end-time "$END_TIME" \
           --period 300 \
-          --statistics Average Maximum \
-          --output table || echo "No memory metrics available"
+          --statistics Average,Maximum,Minimum \
+          --query 'Datapoints[*].[Timestamp,Average,Maximum,Minimum]' \
+          --output text 2>/dev/null)
+        
+        if [ -n "$MEMORY_STATS" ]; then
+          echo "$MEMORY_STATS" | sort | tail -10 | while read timestamp avg max min; do
+            printf "  %s: Avg=%.1f%%, Max=%.1f%%, Min=%.1f%%\n" "$(date -d "$timestamp" '+%H:%M:%S')" "$avg" "$max" "$min"
+          done
+        else
+          echo "  No memory metrics available for the specified time range"
+        fi
+        echo ""
+        
+        # Service-level metrics
+        echo "🔧 SERVICE METRICS"
+        echo "=================="
+        
+        # Running tasks count
+        echo "📊 Active Tasks:"
+        RUNNING_TASKS=$(aws cloudwatch get-metric-statistics \
+          --namespace AWS/ECS \
+          --metric-name RunningTasksCount \
+          --dimensions Name=ClusterName,Value=$CLUSTER_NAME \
+          --start-time "$START_TIME" \
+          --end-time "$END_TIME" \
+          --period 300 \
+          --statistics Average,Maximum \
+          --query 'Datapoints[*].[Timestamp,Average,Maximum]' \
+          --output text 2>/dev/null)
+        
+        if [ -n "$RUNNING_TASKS" ]; then
+          echo "$RUNNING_TASKS" | sort | tail -5 | while read timestamp avg max; do
+            printf "  %s: Avg=%.1f, Max=%.0f\n" "$(date -d "$timestamp" '+%H:%M:%S')" "$avg" "$max"
+          done
+        else
+          echo "  No running tasks metrics available"
+        fi
+        echo ""
+        
+        # Task-specific monitoring
+        if [ -n "$TASK_ARNS" ]; then
+          echo "🎯 INDIVIDUAL TASK PERFORMANCE"
+          echo "=============================="
+          
+          for TASK_ARN in $TASK_ARNS; do
+            if [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
+              TASK_ID=$(echo "$TASK_ARN" | cut -d'/' -f3)
+              echo "📋 Task: $TASK_ID"
+              
+              # Get task details
+              TASK_DETAILS=$(aws ecs describe-tasks \
+                --cluster "$CLUSTER_NAME" \
+                --tasks "$TASK_ARN" \
+                --query 'tasks[0].[createdAt,startedAt,stoppedAt,lastStatus,containers[0].exitCode,stoppedReason]' \
+                --output text 2>/dev/null)
+              
+              if [ -n "$TASK_DETAILS" ]; then
+                echo "$TASK_DETAILS" | while read created started stopped status exit_code reason; do
+                  echo "  Created: $created"
+                  echo "  Started: $started"
+                  echo "  Stopped: $stopped"
+                  echo "  Status: $status"
+                  echo "  Exit Code: $exit_code"
+                  [ "$reason" != "None" ] && echo "  Stop Reason: $reason"
+                  
+                  # Calculate duration if task completed
+                  if [ "$started" != "None" ] && [ "$stopped" != "None" ]; then
+                    DURATION=$(( $(date -d "$stopped" +%s) - $(date -d "$started" +%s) ))
+                    echo "  Duration: $((DURATION / 60)) minutes $((DURATION % 60)) seconds"
+                  fi
+                done
+              fi
+              echo ""
+            fi
+          done
+        fi
+        
+        # Cost estimation
+        echo "💰 COST ESTIMATION"
+        echo "=================="
+        
+        # Calculate Fargate costs based on CPU and memory usage
+        CPU_VCPU=$(((${{ github.event.inputs.task_cpu }} + 1023) / 1024))
+        MEMORY_GB=$(((${{ github.event.inputs.task_memory }} + 1023) / 1024))
+        
+        # Fargate pricing (approximate - varies by region)
+        VCPU_COST_PER_HOUR=0.04048
+        GB_COST_PER_HOUR=0.004445
+        
+        if [ -n "$SUCCESSFUL_MONTHS" ]; then
+          SUCCESSFUL_COUNT=$(echo $SUCCESSFUL_MONTHS | wc -w)
+          if [ "${{ github.event.inputs.pipeline_mode }}" = "full" ]; then
+            ESTIMATED_HOURS_PER_TASK=0.3  # 18 minutes average
+          else
+            ESTIMATED_HOURS_PER_TASK=0.05  # 3 minutes average
+          fi
+          
+          TOTAL_VCPU_HOURS=$(echo "$SUCCESSFUL_COUNT * $CPU_VCPU * $ESTIMATED_HOURS_PER_TASK" | bc -l)
+          TOTAL_MEMORY_HOURS=$(echo "$SUCCESSFUL_COUNT * $MEMORY_GB * $ESTIMATED_HOURS_PER_TASK" | bc -l)
+          
+          VCPU_COST=$(echo "$TOTAL_VCPU_HOURS * $VCPU_COST_PER_HOUR" | bc -l)
+          MEMORY_COST=$(echo "$TOTAL_MEMORY_HOURS * $GB_COST_PER_HOUR" | bc -l)
+          TOTAL_COST=$(echo "$VCPU_COST + $MEMORY_COST" | bc -l)
+          
+          printf "💸 Estimated Fargate costs:\n"
+          printf "  CPU: %.4f vCPU-hours × \$%.5f = \$%.4f\n" "$TOTAL_VCPU_HOURS" "$VCPU_COST_PER_HOUR" "$VCPU_COST"
+          printf "  Memory: %.4f GB-hours × \$%.6f = \$%.4f\n" "$TOTAL_MEMORY_HOURS" "$GB_COST_PER_HOUR" "$MEMORY_COST"
+          printf "  Total: \$%.4f\n" "$TOTAL_COST"
+        else
+          echo "  No successful tasks to calculate costs"
+        fi
+        echo ""
+        
+        # Summary
+        echo "📋 MONITORING SUMMARY"
+        echo "===================="
+        echo "Monitoring period: $(date -d "$START_TIME" '+%Y-%m-%d %H:%M:%S') to $(date -d "$END_TIME" '+%Y-%m-%d %H:%M:%S')"
+        echo "Cluster: $CLUSTER_NAME"
+        echo "Task Definition: $TASK_DEFINITION"
+        echo "Resource allocation: ${{ github.event.inputs.task_cpu }} CPU units, ${{ github.event.inputs.task_memory }} MiB memory"
+        
+        if [ -n "$SUCCESSFUL_MONTHS" ]; then
+          echo "✅ Successfully processed: $(echo $SUCCESSFUL_MONTHS | wc -w) months"
+        fi
+        
+        if [ -n "$FAILED_MONTHS" ]; then
+          echo "❌ Failed to process: $(echo $FAILED_MONTHS | wc -w) months"
+          echo "📊 For detailed task logs, check CloudWatch Logs:"
+          echo "   https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/%2Fecs%2F${{ env.PROJECT_NAME }}"
+        fi
+        
+        echo ""
+        echo "🔗 Additional monitoring resources:"
+        echo "  - ECS Console: https://console.aws.amazon.com/ecs/home?region=${{ env.AWS_REGION }}#/clusters/$CLUSTER_NAME"
+        echo "  - CloudWatch Metrics: https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#metricsV2:graph=~();namespace=AWS/ECS"
