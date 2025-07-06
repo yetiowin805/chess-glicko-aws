@@ -3,8 +3,12 @@ name: Manual Glicko Pipeline Run
 on:
   workflow_dispatch:
     inputs:
-      month:
-        description: 'Month to process (YYYY-MM format)'
+      first_month:
+        description: 'First month to process (YYYY-MM format)'
+        required: true
+        default: '2024-01'
+      last_month:
+        description: 'Last month to process (YYYY-MM format)'
         required: true
         default: '2024-01'
       task_cpu:
@@ -42,10 +46,67 @@ jobs:
 
     - name: Validate Month Format
       run: |
-        if [[ ! "${{ github.event.inputs.month }}" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
-          echo "Error: Month must be in YYYY-MM format"
+        if [[ ! "${{ github.event.inputs.first_month }}" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
+          echo "Error: First month must be in YYYY-MM format"
           exit 1
         fi
+        if [[ ! "${{ github.event.inputs.last_month }}" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
+          echo "Error: Last month must be in YYYY-MM format"
+          exit 1
+        fi
+        
+        # Validate that first_month <= last_month
+        if [[ "${{ github.event.inputs.first_month }}" > "${{ github.event.inputs.last_month }}" ]]; then
+          echo "Error: First month must be less than or equal to last month"
+          exit 1
+        fi
+
+    - name: Generate Month Range
+      id: months
+      run: |
+        echo "=== Generating Month Range ==="
+        
+        # Parse input dates
+        FIRST_MONTH="${{ github.event.inputs.first_month }}"
+        LAST_MONTH="${{ github.event.inputs.last_month }}"
+        
+        echo "Processing from $FIRST_MONTH to $LAST_MONTH"
+        
+        # Generate list of months
+        MONTHS=""
+        CURRENT_MONTH="$FIRST_MONTH"
+        
+        while [[ "$CURRENT_MONTH" <= "$LAST_MONTH" ]]; do
+          if [[ -n "$MONTHS" ]]; then
+            MONTHS="$MONTHS $CURRENT_MONTH"
+          else
+            MONTHS="$CURRENT_MONTH"
+          fi
+          
+          # Calculate next month
+          YEAR=$(echo $CURRENT_MONTH | cut -d'-' -f1)
+          MONTH=$(echo $CURRENT_MONTH | cut -d'-' -f2)
+          
+          # Increment month
+          MONTH=$((10#$MONTH + 1))
+          
+          # Handle year rollover
+          if [[ $MONTH -gt 12 ]]; then
+            MONTH=1
+            YEAR=$((YEAR + 1))
+          fi
+          
+          # Format next month
+          CURRENT_MONTH=$(printf "%04d-%02d" $YEAR $MONTH)
+        done
+        
+        echo "months=$MONTHS" >> $GITHUB_OUTPUT
+        echo "Months to process: $MONTHS"
+        
+        # Count months for logging
+        MONTH_COUNT=$(echo $MONTHS | wc -w)
+        echo "month_count=$MONTH_COUNT" >> $GITHUB_OUTPUT
+        echo "Total months to process: $MONTH_COUNT"
 
     - name: Get Infrastructure Details
       id: infra
@@ -110,16 +171,19 @@ jobs:
         fi
         echo "security_group_id=$SG_ID" >> $GITHUB_OUTPUT
 
-    - name: Run Pipeline Task
+    - name: Run Pipeline for Each Month
       env:
         CLUSTER_NAME: ${{ steps.infra.outputs.cluster_name }}
         TASK_DEFINITION: ${{ steps.infra.outputs.task_definition }}
         S3_BUCKET_NAME: ${{ steps.infra.outputs.s3_bucket_name }}
         SUBNET_IDS: ${{ steps.infra.outputs.subnet_ids }}
         SECURITY_GROUP_ID: ${{ steps.infra.outputs.security_group_id }}
+        MONTHS: ${{ steps.months.outputs.months }}
+        MONTH_COUNT: ${{ steps.months.outputs.month_count }}
       run: |
-        echo "=== Running ${{ github.event.inputs.pipeline_mode }} Pipeline ==="
-        echo "Month: ${{ github.event.inputs.month }}"
+        echo "=== Running ${{ github.event.inputs.pipeline_mode }} Pipeline for Multiple Months ==="
+        echo "Date range: ${{ github.event.inputs.first_month }} to ${{ github.event.inputs.last_month }}"
+        echo "Total months: $MONTH_COUNT"
         echo "Mode: ${{ github.event.inputs.pipeline_mode }}"
         echo "CPU: ${{ github.event.inputs.task_cpu }}"
         echo "Memory: ${{ github.event.inputs.task_memory }}"
@@ -128,124 +192,176 @@ jobs:
         echo "S3 Bucket: $S3_BUCKET_NAME"
         echo "Subnets: $SUBNET_IDS"
         echo "Security Group: $SECURITY_GROUP_ID"
+        echo ""
         
         # Prepare pipeline mode description
         if [ "${{ github.event.inputs.pipeline_mode }}" = "full" ]; then
-          echo "📊 Full pipeline will run all steps:"
+          echo "📊 Full pipeline will run all steps for each month:"
           echo "  - Download data archives"
           echo "  - Extract and process games"
           echo "  - Calculate Glicko ratings"
           echo "  - Upload results to S3"
-          echo "  ⚠️  Expected duration: 15-20 minutes"
+          ESTIMATED_TIME_PER_MONTH=17
+          echo "  ⚠️  Expected duration per month: 15-20 minutes"
         else
-          echo "📊 Post-scraping pipeline will run:"
+          echo "📊 Post-scraping pipeline will run for each month:"
           echo "  - Process calculation data"
           echo "  - Calculate Glicko ratings"
           echo "  - Upload results to S3"
-          echo "  ⚠️  Expected duration: 2-5 minutes"
+          ESTIMATED_TIME_PER_MONTH=3
+          echo "  ⚠️  Expected duration per month: 2-5 minutes"
         fi
+        
+        TOTAL_ESTIMATED_TIME=$((ESTIMATED_TIME_PER_MONTH * MONTH_COUNT))
+        echo "  🕐 Total estimated time: ~$TOTAL_ESTIMATED_TIME minutes"
         echo ""
         
-        # Run the task
-        echo "Starting pipeline task..."
-        TASK_ARN=$(aws ecs run-task \
-          --cluster $CLUSTER_NAME \
-          --task-definition $TASK_DEFINITION \
-          --launch-type FARGATE \
-          --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],assignPublicIp=ENABLED,securityGroups=[$SECURITY_GROUP_ID]}" \
-          --overrides "{
-            \"taskRoleArn\": \"$(aws ecs describe-task-definition --task-definition $TASK_DEFINITION --query 'taskDefinition.taskRoleArn' --output text)\",
-            \"cpu\": \"${{ github.event.inputs.task_cpu }}\",
-            \"memory\": \"${{ github.event.inputs.task_memory }}\",
-            \"containerOverrides\": [{
-              \"name\": \"chess-glicko\",
-              \"environment\": [{
-                \"name\": \"PROCESS_MONTH\",
-                \"value\": \"${{ github.event.inputs.month }}\"
-              }, {
-                \"name\": \"PIPELINE_MODE\",
-                \"value\": \"${{ github.event.inputs.pipeline_mode }}\"
-              }, {
-                \"name\": \"S3_BUCKET\",
-                \"value\": \"$S3_BUCKET_NAME\"
-              }]
-            }]
-          }" \
-          --query 'tasks[0].taskArn' \
-          --output text)
+        # Track results
+        SUCCESSFUL_MONTHS=""
+        FAILED_MONTHS=""
+        CURRENT_MONTH_NUM=1
         
-        if [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
-          echo "✅ Pipeline task started successfully!"
-          echo "Task ARN: $TASK_ARN"
-          echo ""
+        # Process each month
+        for MONTH in $MONTHS; do
+          echo "=================================="
+          echo "🗓️  Processing month $CURRENT_MONTH_NUM of $MONTH_COUNT: $MONTH"
+          echo "=================================="
           
-          # Wait and check initial status
-          echo "⏳ Checking initial task status..."
-          sleep 15
-          TASK_STATUS=$(aws ecs describe-tasks \
-            --cluster "$CLUSTER_NAME" \
-            --tasks "$TASK_ARN" \
-            --query 'tasks[0].lastStatus' \
+          # Run the task
+          echo "Starting pipeline task for $MONTH..."
+          TASK_ARN=$(aws ecs run-task \
+            --cluster $CLUSTER_NAME \
+            --task-definition $TASK_DEFINITION \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],assignPublicIp=ENABLED,securityGroups=[$SECURITY_GROUP_ID]}" \
+            --overrides "{
+              \"taskRoleArn\": \"$(aws ecs describe-task-definition --task-definition $TASK_DEFINITION --query 'taskDefinition.taskRoleArn' --output text)\",
+              \"cpu\": \"${{ github.event.inputs.task_cpu }}\",
+              \"memory\": \"${{ github.event.inputs.task_memory }}\",
+              \"containerOverrides\": [{
+                \"name\": \"chess-glicko\",
+                \"environment\": [{
+                  \"name\": \"PROCESS_MONTH\",
+                  \"value\": \"$MONTH\"
+                }, {
+                  \"name\": \"PIPELINE_MODE\",
+                  \"value\": \"${{ github.event.inputs.pipeline_mode }}\"
+                }, {
+                  \"name\": \"S3_BUCKET\",
+                  \"value\": \"$S3_BUCKET_NAME\"
+                }]
+              }]
+            }" \
+            --query 'tasks[0].taskArn' \
             --output text)
-          echo "Task status after 15 seconds: $TASK_STATUS"
           
-          # Check if task failed to start
-          if [ "$TASK_STATUS" = "STOPPED" ]; then
-            echo "❌ Task stopped unexpectedly. Checking for errors..."
-            aws ecs describe-tasks \
-              --cluster "$CLUSTER_NAME" \
-              --tasks "$TASK_ARN" \
-              --query 'tasks[0].stoppedReason' \
-              --output text
-            exit 1
-          fi
-          
-          echo ""
-          echo "📊 Monitor progress:"
-          echo "  - Task status: aws ecs describe-tasks --cluster $CLUSTER_NAME --tasks $TASK_ARN"
-          echo "  - Logs: aws logs tail /ecs/${{ env.PROJECT_NAME }} --follow"
-          echo ""
-          echo "🔗 AWS Console Links:"
-          echo "  - ECS Task: https://console.aws.amazon.com/ecs/home?region=${{ env.AWS_REGION }}#/clusters/$CLUSTER_NAME/tasks"
-          echo "  - CloudWatch Logs: https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/%2Fecs%2F${{ env.PROJECT_NAME }}"
-          echo ""
-          if [ "${{ github.event.inputs.pipeline_mode }}" = "full" ]; then
-            echo "💡 Full pipeline typically takes 15-20 minutes. Check logs for progress updates."
+          if [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
+            echo "✅ Pipeline task started successfully for $MONTH!"
+            echo "Task ARN: $TASK_ARN"
+            
+            # Wait for task to complete
+            echo "⏳ Waiting for task to complete..."
+            TASK_STATUS="RUNNING"
+            MAX_WAIT_TIME=1800  # 30 minutes max wait
+            WAIT_TIME=0
+            
+            while [[ "$TASK_STATUS" != "STOPPED" && $WAIT_TIME -lt $MAX_WAIT_TIME ]]; do
+              sleep 30
+              WAIT_TIME=$((WAIT_TIME + 30))
+              TASK_STATUS=$(aws ecs describe-tasks \
+                --cluster "$CLUSTER_NAME" \
+                --tasks "$TASK_ARN" \
+                --query 'tasks[0].lastStatus' \
+                --output text 2>/dev/null || echo "UNKNOWN")
+              
+              if [[ $((WAIT_TIME % 180)) -eq 0 ]]; then  # Log every 3 minutes
+                echo "⏳ Task still running after $((WAIT_TIME / 60)) minutes... (Status: $TASK_STATUS)"
+              fi
+            done
+            
+            # Check final status
+            if [[ "$TASK_STATUS" = "STOPPED" ]]; then
+              EXIT_CODE=$(aws ecs describe-tasks \
+                --cluster "$CLUSTER_NAME" \
+                --tasks "$TASK_ARN" \
+                --query 'tasks[0].containers[0].exitCode' \
+                --output text 2>/dev/null || echo "unknown")
+              
+              if [[ "$EXIT_CODE" = "0" ]]; then
+                echo "✅ Task completed successfully for $MONTH!"
+                SUCCESSFUL_MONTHS="$SUCCESSFUL_MONTHS $MONTH"
+              else
+                echo "❌ Task failed for $MONTH (Exit code: $EXIT_CODE)"
+                STOP_REASON=$(aws ecs describe-tasks \
+                  --cluster "$CLUSTER_NAME" \
+                  --tasks "$TASK_ARN" \
+                  --query 'tasks[0].stoppedReason' \
+                  --output text 2>/dev/null || echo "unknown")
+                echo "Stop reason: $STOP_REASON"
+                FAILED_MONTHS="$FAILED_MONTHS $MONTH"
+              fi
+            else
+              echo "❌ Task timed out for $MONTH (waited $((WAIT_TIME / 60)) minutes)"
+              FAILED_MONTHS="$FAILED_MONTHS $MONTH"
+            fi
           else
-            echo "💡 Post-scraping pipeline typically takes 2-5 minutes. Check logs for progress updates."
+            echo "❌ Failed to start pipeline task for $MONTH"
+            echo "Task ARN: '$TASK_ARN'"
+            FAILED_MONTHS="$FAILED_MONTHS $MONTH"
           fi
-        else
-          echo "❌ Failed to start pipeline task"
-          echo "Task ARN: '$TASK_ARN'"
+          
+          CURRENT_MONTH_NUM=$((CURRENT_MONTH_NUM + 1))
+          echo ""
+        done
+        
+        echo "=================================="
+        echo "📊 FINAL RESULTS"
+        echo "=================================="
+        echo "Total months processed: $MONTH_COUNT"
+        
+        if [[ -n "$SUCCESSFUL_MONTHS" ]]; then
+          SUCCESSFUL_COUNT=$(echo $SUCCESSFUL_MONTHS | wc -w)
+          echo "✅ Successful months ($SUCCESSFUL_COUNT):$SUCCESSFUL_MONTHS"
+        fi
+        
+        if [[ -n "$FAILED_MONTHS" ]]; then
+          FAILED_COUNT=$(echo $FAILED_MONTHS | wc -w)
+          echo "❌ Failed months ($FAILED_COUNT):$FAILED_MONTHS"
+          echo ""
+          echo "🔗 Check logs for failed months:"
+          echo "  - CloudWatch Logs: https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/%2Fecs%2F${{ env.PROJECT_NAME }}"
           exit 1
+        else
+          echo "🎉 All months processed successfully!"
         fi
 
-    - name: Monitor Resource Usage
+    - name: Monitor Overall Resource Usage
+      if: always()
       env:
         CLUSTER_NAME: ${{ steps.infra.outputs.cluster_name }}
       run: |
-        echo "=== Monitoring Resource Usage ==="
+        echo "=== Overall Resource Usage Summary ==="
         
-        # Wait for task to start
-        sleep 30
-        
-        # Get current resource utilization
+        # Get resource utilization for the last hour
+        echo "📊 CPU Utilization:"
         aws cloudwatch get-metric-statistics \
           --namespace AWS/ECS \
           --metric-name CPUUtilization \
           --dimensions Name=ClusterName,Value=$CLUSTER_NAME \
-          --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+          --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
           --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
-          --period 60 \
-          --statistics Average,Maximum \
-          --output table
+          --period 300 \
+          --statistics Average Maximum \
+          --output table || echo "No CPU metrics available"
         
+        echo ""
+        echo "📊 Memory Utilization:"
         aws cloudwatch get-metric-statistics \
           --namespace AWS/ECS \
           --metric-name MemoryUtilization \
           --dimensions Name=ClusterName,Value=$CLUSTER_NAME \
-          --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+          --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
           --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
-          --period 60 \
-          --statistics Average,Maximum \
-          --output table
+          --period 300 \
+          --statistics Average Maximum \
+          --output table || echo "No memory metrics available"
