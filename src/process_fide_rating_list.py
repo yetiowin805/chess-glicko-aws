@@ -128,9 +128,13 @@ class FIDEDataProcessor:
             # Primary key (id) is automatically indexed
             conn.execute('CREATE INDEX idx_name ON players(name)')
             
-            # Prepare insert statement
+            # Prepare insert statement with OR IGNORE to handle duplicates
             placeholders = ', '.join(['?' for _ in keys])
-            insert_sql = f"INSERT INTO players ({', '.join(keys)}) VALUES ({placeholders})"
+            insert_sql = f"INSERT OR IGNORE INTO players ({', '.join(keys)}) VALUES ({placeholders})"
+            
+            # Keep track of seen IDs for duplicate detection
+            seen_ids = {}
+            duplicate_count = 0
             
             with open(input_filename, "r", encoding="utf-8", errors="replace") as input_file:
                 
@@ -143,34 +147,57 @@ class FIDEDataProcessor:
                     input_file.readline()
                 
                 line_count = 0
-                batch_data = []
-                batch_size = 1000
+                processed_count = 0
                 
                 for line in input_file:
                     try:
                         parts = self._process_line(line, lengths)
                         # Convert data types as needed
                         processed_parts = self._convert_data_types(parts, keys)
-                        batch_data.append(processed_parts)
+                        
+                        # Get the ID (first element)
+                        player_id = processed_parts[0]
+                        
+                        # Check for duplicates
+                        if player_id in seen_ids:
+                            duplicate_count += 1
+                            # Log warning with both sets of attributes
+                            original_attrs = dict(zip(keys, seen_ids[player_id]))
+                            current_attrs = dict(zip(keys, processed_parts))
+                            
+                            logger.warning(f"Duplicate ID found: {player_id}")
+                            logger.warning(f"  Original record: {original_attrs}")
+                            logger.warning(f"  Duplicate record: {current_attrs}")
+                            logger.warning(f"  Ignoring duplicate record")
+                        else:
+                            # Store the first occurrence
+                            seen_ids[player_id] = processed_parts
+                        
+                        # Execute insert (will be ignored if duplicate due to OR IGNORE)
+                        cursor = conn.execute(insert_sql, processed_parts)
+                        
+                        # Check if the row was actually inserted
+                        if cursor.rowcount > 0:
+                            processed_count += 1
+                        
                         line_count += 1
                         
-                        # Insert in batches for better performance
-                        if len(batch_data) >= batch_size:
-                            conn.executemany(insert_sql, batch_data)
-                            batch_data = []
+                        # Log progress for large files
+                        if line_count % 10000 == 0:
+                            logger.info(f"Processed {line_count} lines, {processed_count} records inserted, {duplicate_count} duplicates ignored")
                             
                     except Exception as e:
                         logger.warning(f"Failed to process line {line_count + 1}: {str(e)}")
                         continue
                 
-                # Insert remaining data
-                if batch_data:
-                    conn.executemany(insert_sql, batch_data)
-                
                 conn.commit()
                 conn.close()
                 
-                logger.info(f"Processed {line_count} records into SQLite database for {time_control if time_control else 'standard'} rating list")
+                logger.info(f"Processing complete for {time_control if time_control else 'standard'} rating list:")
+                logger.info(f"  Total lines processed: {line_count}")
+                logger.info(f"  Records inserted: {processed_count}")
+                logger.info(f"  Duplicates ignored: {duplicate_count}")
+                
                 return True
                 
         except Exception as e:
