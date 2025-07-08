@@ -65,7 +65,7 @@ class PlayerDataDownloader:
             else:
                 # Download only standard rating list (pre-2012 format)
                 local_file = os.path.join(self.local_temp_dir, f"{year}-{month:02d}.txt")
-                s3_key = f"persistent/player_info/raw/{year}-{month:02d}.txt"
+                s3_key = f"persistent/player_info/raw/standard/{year}-{month:02d}.txt"
                 
                 # Check if file already exists in S3
                 if self._check_s3_file_exists(s3_key):
