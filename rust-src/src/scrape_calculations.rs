@@ -130,13 +130,6 @@ impl PlayerCalculationScraper {
 
         info!("Starting calculation scraping for {}-{:02}", year, month);
 
-        // Check if completion marker already exists
-        let completion_marker_key = format!("results/{}/calculation_scraping_completion.json", month_str);
-        if self.file_exists_in_s3(&completion_marker_key).await? {
-            info!("Completion marker already exists ({}). Skipping entire month processing.", completion_marker_key);
-            return Ok(());
-        }
-
         // Create temp directory
         fs::create_dir_all(&self.local_temp_dir).await?;
 
