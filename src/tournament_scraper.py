@@ -75,9 +75,12 @@ class FIDETournamentScraper:
             if month % 2 == 1:  # odd month
                 if month == 1:
                     return [f"{year-1}-11", f"{year-1}-12"]
-                else:
-                    prev_month = month - 2
-                    return [f"{year}-{prev_month:02d}", f"{year}-{month-1:02d}"]
+                if month == 3:
+                    return [f"{year}-01", f"{year}-02"]
+                if month == 5:
+                    return [f"{year}-03", f"{year}-04"]
+                if month == 7:
+                    return [f"{year}-05", f"{year}-06"]
         else:
             # Monthly periods
             return [f"{year}-{month:02d}"]
@@ -123,16 +126,16 @@ class FIDETournamentScraper:
             except:
                 return period_months[-1]  # Default to last month if parsing fails
 
-        # Try date received first
-        received_dt = parse_date(date_received)
-        if received_dt:
-            target_month = get_next_month(received_dt)
-            return round_to_period(target_month, period_months)
-
         # Fall back to end date
         end_dt = parse_date(end_date)
         if end_dt:
             target_month = get_next_month(end_dt)
+            return round_to_period(target_month, period_months)
+        
+        # Try date received first
+        received_dt = parse_date(date_received)
+        if received_dt:
+            target_month = get_next_month(received_dt)
             return round_to_period(target_month, period_months)
 
         # Default to last month of period
