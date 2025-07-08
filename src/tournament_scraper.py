@@ -205,7 +205,7 @@ class FIDETournamentScraper:
                 logger.info(f"Total tournaments processed: {total_tournaments}")
                 
                 # Create and upload SQLite databases for each month
-                await self._create_and_upload_databases(period_months, year)
+                await self._create_and_upload_databases(period_months, year, month)
                 
                 # Log failures for debugging
                 if failed:
@@ -474,7 +474,7 @@ class FIDETournamentScraper:
 
         return player_data, time_control
 
-    async def _create_and_upload_databases(self, period_months: List[str], year: int):
+    async def _create_and_upload_databases(self, period_months: List[str], year: int, month: int):
         """Create SQLite databases for each month and time control and upload to S3"""
         # Determine which time controls to create based on year
         time_controls_to_create = ["standard"]
