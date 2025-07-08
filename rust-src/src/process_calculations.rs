@@ -160,9 +160,12 @@ impl CalculationProcessor {
         // Parse year from month string
         let year: i32 = self.month_str[0..4].parse()
             .context("Invalid month format")?;
+
+        let month: u32 = self.month_str[4..6].parse()
+            .context("Invalid month format")?;
         
         // Determine which time controls to process
-        let time_controls_to_process = if year >= 2012 {
+        let time_controls_to_process = if year > 2012 || (year == 2012 && month >= 2) {
             TIME_CONTROLS
         } else {
             &["standard"]
@@ -242,11 +245,24 @@ impl CalculationProcessor {
     }
 
     async fn load_player_database(&self, time_control: &str) -> Result<PlayerMappings> {
+        // For 2012 months 2-8, use standard rating lists for rapid and blitz
+        let year: i32 = self.month_str[0..4].parse()
+            .context("Invalid month format in month_str")?;
+        let month: u32 = self.month_str[4..6].parse()
+            .context("Invalid month format in month_str")?;
+        
+        let database_time_control = if (time_control == "rapid" || time_control == "blitz") &&
+                                        year == 2012 && month < 9 {
+            "standard"  // Use standard database for rapid/blitz in 2012 months 2-8
+        } else {
+            time_control
+        };
+        
         let s3_key = format!("persistent/player_info/processed/{}/{}.db", 
-                            time_control, self.month_str);
+                            database_time_control, self.month_str);
         let local_db_path = self.temp_dir.join(format!("{}_{}.db", self.month_str, time_control));
         
-        info!("Downloading player database for {}...", time_control);
+        info!("Downloading player database for {} (using {} database)...", time_control, database_time_control);
         
         self.download_file(&s3_key, &local_db_path).await
             .context("Failed to download player database")?;
