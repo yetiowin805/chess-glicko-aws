@@ -161,7 +161,7 @@ impl CalculationProcessor {
         let year: i32 = self.month_str[0..4].parse()
             .context("Invalid month format")?;
 
-        let month: u32 = self.month_str[4..6].parse()
+        let month: u32 = self.month_str[5..7].parse()
             .context("Invalid month format")?;
         
         // Determine which time controls to process
