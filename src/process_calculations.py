@@ -47,7 +47,7 @@ class CalculationProcessor:
             
             # Determine which time controls to process based on year
             time_controls_to_process = ["standard"]
-            if year >= 2012:
+            if year > 2012 or (year == 2012 and month >= 2):
                 time_controls_to_process.extend(["rapid", "blitz"])
             
             logger.info(f"Processing time controls: {time_controls_to_process}")
@@ -57,9 +57,10 @@ class CalculationProcessor:
             for time_control in time_controls_to_process:
                 try:
                     # Load SQLite database for this time control
-                    await self._load_player_database(time_control)
-                    
-                    result = await self._process_time_control(time_control)
+                    if year == 2012 and month < 9:
+                        result = await self._load_player_database("standard")
+                    else:
+                        result = await self._process_time_control(time_control)
                     results.append((time_control, result))
                     
                     # Close database connection for this time control
