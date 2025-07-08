@@ -102,6 +102,23 @@ impl PlayerCalculationScraper {
         })
     }
 
+    async fn file_exists_in_s3(&self, key: &str) -> Result<bool> {
+        match self.s3_client.head_object().bucket(&self.s3_bucket).key(key).send().await {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                // Check if it's a "not found" error vs actual error
+                if let Some(service_err) = err.as_service_error() {
+                    if service_err.is_not_found() {
+                        return Ok(false);
+                    }
+                }
+                // For other errors, we should probably fail gracefully and continue
+                warn!("Error checking if file exists in S3 ({}): {}", key, err);
+                Ok(false)
+            }
+        }
+    }
+
     async fn scrape_calculations_for_month(&self, month_str: &str) -> Result<()> {
         let parts: Vec<&str> = month_str.split('-').collect();
         if parts.len() != 2 {
@@ -112,6 +129,13 @@ impl PlayerCalculationScraper {
         let month: u32 = parts[1].parse()?;
 
         info!("Starting calculation scraping for {}-{:02}", year, month);
+
+        // Check if completion marker already exists
+        let completion_marker_key = format!("results/{}/calculation_scraping_completion.json", month_str);
+        if self.file_exists_in_s3(&completion_marker_key).await? {
+            info!("Completion marker already exists ({}). Skipping entire month processing.", completion_marker_key);
+            return Ok(());
+        }
 
         // Create temp directory
         fs::create_dir_all(&self.local_temp_dir).await?;
@@ -135,12 +159,16 @@ impl PlayerCalculationScraper {
         // Process results
         let mut successful = Vec::new();
         let mut failed = Vec::new();
+        let mut skipped = Vec::new();
 
         for (i, result) in results.into_iter().enumerate() {
             let tc = ["standard", "rapid", "blitz"][i];
             match result {
-                Ok((processed, success_count)) => {
+                Ok(Some((processed, success_count))) => {
                     successful.push((tc.to_string(), processed, success_count));
+                }
+                Ok(None) => {
+                    skipped.push(tc.to_string());
                 }
                 Err(e) => {
                     failed.push((tc.to_string(), e.to_string()));
@@ -151,23 +179,39 @@ impl PlayerCalculationScraper {
         let total_processed: usize = successful.iter().map(|(_, p, _)| p).sum();
         let total_successful: usize = successful.iter().map(|(_, _, s)| s).sum();
 
-        info!("Results - Time controls: {} successful, {} failed", successful.len(), failed.len());
+        info!("Results - Time controls: {} successful, {} failed, {} skipped", 
+              successful.len(), failed.len(), skipped.len());
         info!("Total calculations: {} processed, {} successful", total_processed, total_successful);
 
         if !failed.is_empty() {
             error!("Failed time controls: {:?}", failed);
         }
+        if !skipped.is_empty() {
+            info!("Skipped time controls (already exist): {:?}", skipped);
+        }
 
-        self.upload_completion_marker(month_str, &successful, &failed).await?;
+        // Only upload completion marker if we actually processed something or had failures
+        if !successful.is_empty() || !failed.is_empty() {
+            self.upload_completion_marker(month_str, &successful, &failed).await?;
+        } else {
+            info!("All time controls were skipped - completion marker already exists or no work needed");
+        }
         Ok(())
     }
 
-    async fn process_time_control(&self, time_control: &str, year: u32, month: u32) -> Result<(usize, usize)> {
+    async fn process_time_control(&self, time_control: &str, year: u32, month: u32) -> Result<Option<(usize, usize)>> {
+        // Check if output file already exists
+        let output_key = format!("persistent/calculations/{}-{:02}/{}.jsonl", year, month, time_control);
+        if self.file_exists_in_s3(&output_key).await? {
+            info!("{}: Output file already exists ({}). Skipping processing.", time_control, output_key);
+            return Ok(None);
+        }
+
         let player_ids = self.download_active_players(time_control, year, month).await?;
 
         if player_ids.is_empty() {
             info!("No active players found for {} {}-{:02}", time_control, year, month);
-            return Ok((0, 0));
+            return Ok(Some((0, 0)));
         }
 
         info!("Processing {} players for {}", player_ids.len(), time_control);
@@ -233,7 +277,7 @@ impl PlayerCalculationScraper {
         fs::remove_file(&jsonl_file_path).await?;
 
         info!("{}: Completed - {}/{} players successful", time_control, total_successful, total_processed);
-        Ok((total_processed, total_successful))
+        Ok(Some((total_processed, total_successful)))
     }
 
     async fn upload_jsonl_file(&self, local_file_path: &str, time_control: &str, year: u32, month: u32) -> Result<()> {

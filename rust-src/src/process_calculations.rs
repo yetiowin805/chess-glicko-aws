@@ -248,7 +248,7 @@ impl CalculationProcessor {
         // For 2012 months 2-8, use standard rating lists for rapid and blitz
         let year: i32 = self.month_str[0..4].parse()
             .context("Invalid month format in month_str")?;
-        let month: u32 = self.month_str[4..6].parse()
+        let month: u32 = self.month_str[5..7].parse()
             .context("Invalid month format in month_str")?;
         
         let database_time_control = if (time_control == "rapid" || time_control == "blitz") &&

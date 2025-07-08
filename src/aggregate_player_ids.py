@@ -46,35 +46,6 @@ class PlayerIDAggregator:
         else:
             return True
 
-    def get_months_in_period(self, year: int, month: int) -> List[str]:
-        """Get all individual months covered by a rating period"""
-        if year < 2009 or (year == 2009 and month < 9):
-            # 3-month periods
-            if month == 1:
-                return [f"{year-1}-11", f"{year-1}-12", f"{year}-01"]
-            elif month == 4:
-                return [f"{year}-02", f"{year}-03", f"{year}-04"]
-            elif month == 7:
-                return [f"{year}-05", f"{year}-06", f"{year}-07"]
-            elif month == 10:
-                return [f"{year}-08", f"{year}-09", f"{year}-10"]
-        elif year < 2012 or (year == 2012 and month < 8):
-            # 2-month periods (odd months)
-            if month % 2 == 1:  # odd month
-                if month == 1:
-                    return [f"{year-1}-12", f"{year}-01"]
-                if month == 3:
-                    return [f"{year}-02", f"{year}-03"]
-                if month == 5:
-                    return [f"{year}-04", f"{year}-05"]
-                if month == 7:
-                    return [f"{year}-06", f"{year}-07"]
-        else:
-            # Monthly periods
-            return [f"{year}-{month:02d}"]
-        
-        return []
-
     async def aggregate_players_for_month(self, month_str):
         """Aggregate player IDs for all time controls for a specific month"""
         try:
@@ -84,10 +55,6 @@ class PlayerIDAggregator:
             if not self.is_valid_rating_period(year, month):
                 logger.warning(f"Invalid rating period: {year}-{month:02d}, skipping")
                 return True
-            
-            # Get all months covered by this period
-            period_months = self.get_months_in_period(year, month)
-            logger.info(f"Rating period {month_str} covers months: {period_months}")
             
             # Setup local temp directory
             os.makedirs(self.local_temp_dir, exist_ok=True)
@@ -104,11 +71,11 @@ class PlayerIDAggregator:
             
             # Process each time control in parallel
             tasks = [
-                self._process_time_control(tc, period_months)
+                self._process_time_control(tc, month_str)
                 for tc in time_controls
             ]
             
-            logger.info(f"Processing {len(time_controls)} time controls across {len(period_months)} months in parallel")
+            logger.info(f"Processing {len(time_controls)} time controls in parallel")
             
             # Execute all time control tasks concurrently
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -142,7 +109,7 @@ class PlayerIDAggregator:
                     logger.error(f"  {tc}: {error}")
             
             # Upload completion marker
-            await self._upload_completion_marker(month_str, len(successful), len(failed), successful, period_months)
+            await self._upload_completion_marker(month_str, len(successful), len(failed), successful)
             
             return True
             
@@ -150,48 +117,43 @@ class PlayerIDAggregator:
             logger.error(f"Error in player aggregation: {str(e)}", exc_info=True)
             raise
 
-    async def _process_time_control(self, time_control: str, period_months: List[str]):
-        """Process tournament databases for a specific time control across multiple months"""
+    async def _process_time_control(self, time_control: str, month_str: str):
+        """Process tournament database for a specific time control for the rating period (single file)"""
         try:
             total_player_count = 0
             databases_found = 0
             
-            # Process each month's database for this time control
-            for period_month in period_months:
-                # Check if tournament database exists for this time control and month
-                s3_key = f"persistent/tournament_data/processed/{time_control}/{period_month}.db"
-                
-                if not await self._check_s3_file_exists_async(s3_key):
-                    logger.debug(f"No tournament database found for {time_control} {period_month}")
-                    continue
-                
-                databases_found += 1
-                logger.info(f"Found tournament database for {time_control} {period_month}, downloading and processing...")
-                
-                # Download the SQLite database
-                local_db_path = await self._download_tournament_database(s3_key, time_control, period_month)
-                
-                if not local_db_path:
-                    logger.error(f"Failed to download tournament database for {time_control} {period_month}")
-                    continue
-                
-                # Extract player IDs from the database
-                player_count = await self._extract_player_ids_from_database(local_db_path, time_control)
-                total_player_count += player_count
-                
-                # Clean up local database file
-                if os.path.exists(local_db_path):
-                    os.remove(local_db_path)
-                
-                logger.info(f"{time_control} {period_month}: Found {player_count} unique players")
+            # Only one database file per time control per rating period
+            # The file is named after the rating period (month_str), not individual months
+            s3_key = f"persistent/tournament_data/processed/{time_control}/{month_str}.db"
             
-            if databases_found == 0:
-                logger.info(f"No tournament databases found for {time_control} across all period months")
+            if not await self._check_s3_file_exists_async(s3_key):
+                logger.info(f"No tournament database found for {time_control} {month_str}")
                 return "skipped"
+            
+            databases_found += 1
+            logger.info(f"Found tournament database for {time_control} {month_str}, downloading and processing...")
+            
+            # Download the SQLite database
+            local_db_path = await self._download_tournament_database(s3_key, time_control, month_str)
+            
+            if not local_db_path:
+                logger.error(f"Failed to download tournament database for {time_control} {month_str}")
+                return "skipped"
+            
+            # Extract player IDs from the database (all records, do not filter by target_month)
+            player_count = await self._extract_player_ids_from_database(local_db_path, time_control)
+            total_player_count += player_count
+            
+            # Clean up local database file
+            if os.path.exists(local_db_path):
+                os.remove(local_db_path)
+            
+            logger.info(f"{time_control} {month_str}: Found {player_count} unique players")
             
             # Get final unique player count for this time control
             final_unique_count = len(self.player_sets[time_control])
-            logger.info(f"{time_control}: Processed {databases_found} databases, {final_unique_count} unique players total")
+            logger.info(f"{time_control}: Processed {databases_found} database, {final_unique_count} unique players total")
             
             return ("success", final_unique_count)
             
@@ -211,9 +173,9 @@ class PlayerIDAggregator:
         except ClientError:
             return False
 
-    async def _download_tournament_database(self, s3_key: str, time_control: str, period_month: str) -> str:
+    async def _download_tournament_database(self, s3_key: str, time_control: str, month_str: str) -> str:
         """Download tournament SQLite database from S3"""
-        local_db_path = os.path.join(self.local_temp_dir, f"tournaments_{time_control}_{period_month}.db")
+        local_db_path = os.path.join(self.local_temp_dir, f"tournaments_{time_control}_{month_str}.db")
         
         try:
             loop = asyncio.get_event_loop()
@@ -316,12 +278,11 @@ class PlayerIDAggregator:
             logger.error(f"Failed to upload to S3: {str(e)}")
             raise
 
-    async def _upload_completion_marker(self, month_str: str, successful: int, failed: int, success_details: List, period_months: List[str]):
+    async def _upload_completion_marker(self, month_str: str, successful: int, failed: int, success_details: List):
         """Upload completion marker with statistics"""
         try:
             completion_data = {
                 "month": month_str,
-                "period_months": period_months,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "statistics": {
                     "time_controls_processed": successful + failed,

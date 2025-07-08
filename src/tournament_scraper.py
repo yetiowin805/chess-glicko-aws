@@ -158,17 +158,15 @@ class FIDETournamentScraper:
             # Setup local temp directory
             os.makedirs(self.local_temp_dir, exist_ok=True)
             
-            # Initialize tournament data structure
-            self.tournament_data = {}
-            for period_month in period_months:
-                self.tournament_data[period_month] = {
-                    "standard": [],
-                    "rapid": [],
-                    "blitz": []
-                }
+            # Initialize tournament data structure - now consolidated by time control only
+            self.tournament_data = {
+                "standard": [],
+                "rapid": [],
+                "blitz": []
+            }
             
-            # Check if SQLite databases already exist for all target months
-            all_exist = await self._check_all_databases_exist(period_months, year)
+            # Check if SQLite databases already exist for all time controls
+            all_exist = await self._check_all_databases_exist(month_str, year)
             if all_exist:
                 logger.info(f"All tournament databases already exist for period {month_str}")
                 return True
@@ -207,8 +205,8 @@ class FIDETournamentScraper:
                 logger.info(f"Results - Countries: {len(successful)} successful, {len(skipped)} skipped, {len(failed)} failed")
                 logger.info(f"Total tournaments processed: {total_tournaments}")
                 
-                # Create and upload SQLite databases for each month
-                await self._create_and_upload_databases(period_months, year, month)
+                # Create and upload consolidated SQLite databases for each time control
+                await self._create_and_upload_databases(month_str, year, month)
                 
                 # Log failures for debugging
                 if failed:
@@ -225,18 +223,17 @@ class FIDETournamentScraper:
             logger.error(f"Error in tournament processing: {str(e)}", exc_info=True)
             raise
 
-    async def _check_all_databases_exist(self, period_months: List[str], year: int) -> bool:
-        """Check if SQLite databases already exist for all time controls and months"""
+    async def _check_all_databases_exist(self, month_str: str, year: int) -> bool:
+        """Check if consolidated SQLite databases already exist for all time controls"""
         # Determine which time controls should exist based on year
         time_controls_to_check = ["standard"]
         if year >= 2012:
             time_controls_to_check.extend(["rapid", "blitz"])
         
-        for period_month in period_months:
-            for time_control in time_controls_to_check:
-                s3_key = f"persistent/tournament_data/processed/{time_control}/{period_month}.db"
-                if not await self._check_s3_file_exists_async(s3_key):
-                    return False
+        for time_control in time_controls_to_check:
+            s3_key = f"persistent/tournament_data/processed/{time_control}/{month_str}.db"
+            if not await self._check_s3_file_exists_async(s3_key):
+                return False
         
         return True
 
@@ -418,15 +415,15 @@ class FIDETournamentScraper:
                             # For monthly periods, use the single month
                             target_month = period_months[0]
 
-                        # Add tournament data to cache (thread-safe)
+                        # Add tournament data to consolidated cache (thread-safe)
                         async with self.data_lock:
-                            if target_month in self.tournament_data:
-                                for player_id, player_name in player_data:
-                                    self.tournament_data[target_month][tc_dir].append({
-                                        'tournament_id': tournament_id,
-                                        'player_id': player_id,
-                                        'player_name': player_name
-                                    })
+                            for player_id, player_name in player_data:
+                                self.tournament_data[tc_dir].append({
+                                    'tournament_id': tournament_id,
+                                    'player_id': player_id,
+                                    'player_name': player_name,
+                                    'target_month': target_month
+                                })
                         
                         return True
 
@@ -477,19 +474,18 @@ class FIDETournamentScraper:
 
         return player_data, time_control
 
-    async def _create_and_upload_databases(self, period_months: List[str], year: int, month: int):
-        """Create SQLite databases for each month and time control and upload to S3"""
+    async def _create_and_upload_databases(self, month_str: str, year: int, month: int):
+        """Create SQLite databases for each time control and upload to S3"""
         # Determine which time controls to create based on year
         time_controls_to_create = ["standard"]
         if year > 2012 or (year == 2012 and month >= 2):
             time_controls_to_create.extend(["rapid", "blitz"])
         
-        for period_month in period_months:
-            for time_control in time_controls_to_create:
-                if self.tournament_data[period_month][time_control]:
-                    await self._create_time_control_database(time_control, period_month)
-                else:
-                    logger.info(f"No data found for {time_control} time control in {period_month}")
+        for time_control in time_controls_to_create:
+            if self.tournament_data[time_control]:
+                await self._create_time_control_database(time_control, month_str)
+            else:
+                logger.info(f"No data found for {time_control} time control")
 
     async def _create_time_control_database(self, time_control: str, month_str: str):
         """Create SQLite database for a specific time control and month"""
@@ -501,12 +497,13 @@ class FIDETournamentScraper:
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('PRAGMA synchronous=NORMAL')
             
-            # Create table
+            # Create table with target_month column
             conn.execute('''
                 CREATE TABLE tournament_players (
                     tournament_id TEXT NOT NULL,
                     player_id TEXT NOT NULL,
                     player_name TEXT NOT NULL,
+                    target_month TEXT NOT NULL,
                     PRIMARY KEY (tournament_id, player_id)
                 )
             ''')
@@ -515,18 +512,19 @@ class FIDETournamentScraper:
             conn.execute('CREATE INDEX idx_tournament_id ON tournament_players(tournament_id)')
             conn.execute('CREATE INDEX idx_player_name ON tournament_players(LOWER(player_name))')
             conn.execute('CREATE INDEX idx_tournament_name ON tournament_players(tournament_id, LOWER(player_name))')
+            conn.execute('CREATE INDEX idx_target_month ON tournament_players(target_month)')
             
             # Insert data in batches
             batch_size = 1000
             data_to_insert = [
-                (record['tournament_id'], record['player_id'], record['player_name'])
-                for record in self.tournament_data[month_str][time_control]
+                (record['tournament_id'], record['player_id'], record['player_name'], record['target_month'])
+                for record in self.tournament_data[time_control]
             ]
             
             for i in range(0, len(data_to_insert), batch_size):
                 batch = data_to_insert[i:i + batch_size]
                 conn.executemany(
-                    'INSERT OR REPLACE INTO tournament_players (tournament_id, player_id, player_name) VALUES (?, ?, ?)',
+                    'INSERT OR REPLACE INTO tournament_players (tournament_id, player_id, player_name, target_month) VALUES (?, ?, ?, ?)',
                     batch
                 )
             
@@ -577,14 +575,10 @@ class FIDETournamentScraper:
     async def _upload_completion_marker(self, month_str: str, successful: int, failed: int, skipped: int, total_tournaments: int, period_months: List[str]):
         """Upload completion marker with statistics"""
         try:
-            # Calculate database records per month and time control
+            # Calculate database records per time control
             database_info = {}
-            for period_month in period_months:
-                database_info[period_month] = {
-                    "standard_records": len(self.tournament_data[period_month]["standard"]),
-                    "rapid_records": len(self.tournament_data[period_month]["rapid"]),
-                    "blitz_records": len(self.tournament_data[period_month]["blitz"])
-                }
+            for time_control in ["standard", "rapid", "blitz"]:
+                database_info[f"{time_control}_records"] = len(self.tournament_data[time_control])
             
             completion_data = {
                 "month": month_str,
@@ -598,8 +592,8 @@ class FIDETournamentScraper:
                     "total_tournaments_processed": total_tournaments
                 },
                 "database_info": database_info,
-                "step": "combined_tournament_processing_multi_month",
-                "method": "aiohttp_parallel_sqlite_multi_month"
+                "step": "combined_tournament_processing_multi_month_consolidated",
+                "method": "aiohttp_parallel_sqlite_consolidated"
             }
             
             local_file = os.path.join(self.local_temp_dir, f"tournament_processing_completion_{month_str}.json")
