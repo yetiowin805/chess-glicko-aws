@@ -7,7 +7,7 @@ import aiofiles
 import boto3
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 from botocore.exceptions import ClientError
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_AWS_REGION = "us-east-2"
 BASE_URL = "https://ratings.fide.com"
 TOURNAMENT_REPORT_PATH = "report.phtml?event="
+TOURNAMENT_INFO_PATH = "tournament_information.phtml?event="
 
 class FIDETournamentScraper:
     def __init__(self, s3_bucket, aws_region=DEFAULT_AWS_REGION):
@@ -33,12 +34,8 @@ class FIDETournamentScraper:
         self.country_semaphore = asyncio.Semaphore(20)  # Max countries processed simultaneously
         self.tournament_semaphore = asyncio.Semaphore(50)  # Max tournaments processed simultaneously
         
-        # Tournament data cache for building SQLite databases
-        self.tournament_data = {
-            "standard": [],
-            "rapid": [],
-            "blitz": []
-        }
+        # Tournament data cache for building SQLite databases - now organized by month and time control
+        self.tournament_data = {}
         
         # Lock for thread-safe access to tournament_data
         self.data_lock = asyncio.Lock()
@@ -50,17 +47,96 @@ class FIDETournamentScraper:
         """
         Validate if the given year and month combination is a valid FIDE rating period.
         """
-        valid = True
         if year < 2009:
-            valid = month % 3 == 1
+            return month in [1, 4, 7, 10]
         elif year == 2009:
-            valid = month < 7 and month % 3 == 1 or month >= 7 and month % 2 == 1
+            return (month < 9 and month in [1, 4, 7]) or (month >= 9 and month % 2 == 1)
         elif year < 2012:
-            valid = month % 2 == 1
+            return month % 2 == 1
         elif year == 2012:
-            valid = (month < 7 and month % 2 == 1) or month >= 7
+            return (month < 8 and month % 2 == 1) or month >= 8
+        else:
+            return True
+
+    def get_months_in_period(self, year: int, month: int) -> List[str]:
+        """Get all individual months covered by a rating period"""
+        if year < 2009 or (year == 2009 and month < 9):
+            # 3-month periods
+            if month == 1:
+                return [f"{year-1}-11", f"{year-1}-12", f"{year}-01"]
+            elif month == 4:
+                return [f"{year}-02", f"{year}-03", f"{year}-04"]
+            elif month == 7:
+                return [f"{year}-05", f"{year}-06", f"{year}-07"]
+            elif month == 10:
+                return [f"{year}-08", f"{year}-09", f"{year}-10"]
+        elif year < 2012 or (year == 2012 and month < 8):
+            # 2-month periods (odd months)
+            if month % 2 == 1:  # odd month
+                if month == 1:
+                    return [f"{year-1}-11", f"{year-1}-12"]
+                else:
+                    prev_month = month - 2
+                    return [f"{year}-{prev_month:02d}", f"{year}-{month-1:02d}"]
+        else:
+            # Monthly periods
+            return [f"{year}-{month:02d}"]
         
-        return valid
+        return []
+
+    def get_target_month_for_tournament(self, date_received: Optional[str], end_date: Optional[str], 
+                                      period_months: List[str]) -> str:
+        """
+        Determine which month a tournament should be assigned to based on dates and period.
+        """
+        def parse_date(date_str: str) -> Optional[datetime]:
+            if not date_str or date_str == "0000-00-00" or date_str.strip() == "":
+                return None
+            try:
+                return datetime.strptime(date_str.strip(), "%Y-%m-%d")
+            except (ValueError, AttributeError):
+                return None
+
+        def get_next_month(date_obj: datetime) -> str:
+            next_month = date_obj.replace(day=1) + timedelta(days=32)
+            return f"{next_month.year}-{next_month.month:02d}"
+
+        def round_to_period(target_month: str, period_months: List[str]) -> str:
+            if target_month in period_months:
+                return target_month
+            
+            # Convert to datetime for comparison
+            try:
+                target_dt = datetime.strptime(target_month + "-01", "%Y-%m-%d")
+                period_dts = [datetime.strptime(pm + "-01", "%Y-%m-%d") for pm in period_months]
+                
+                # If target is before the period, use first month
+                if target_dt < min(period_dts):
+                    return period_months[0]
+                # If target is after the period, use last month
+                elif target_dt > max(period_dts):
+                    return period_months[-1]
+                # Otherwise, find closest month
+                else:
+                    closest = min(period_dts, key=lambda x: abs((x - target_dt).days))
+                    return f"{closest.year}-{closest.month:02d}"
+            except:
+                return period_months[-1]  # Default to last month if parsing fails
+
+        # Try date received first
+        received_dt = parse_date(date_received)
+        if received_dt:
+            target_month = get_next_month(received_dt)
+            return round_to_period(target_month, period_months)
+
+        # Fall back to end date
+        end_dt = parse_date(end_date)
+        if end_dt:
+            target_month = get_next_month(end_dt)
+            return round_to_period(target_month, period_months)
+
+        # Default to last month of period
+        return period_months[-1]
 
     async def process_tournaments_for_month(self, month_str):
         """Process tournament data for all countries for a specific month"""
@@ -72,13 +148,26 @@ class FIDETournamentScraper:
                 logger.warning(f"Invalid rating period: {year}-{month:02d}, skipping")
                 return True
             
+            # Get all months covered by this period
+            period_months = self.get_months_in_period(year, month)
+            logger.info(f"Rating period {month_str} covers months: {period_months}")
+            
             # Setup local temp directory
             os.makedirs(self.local_temp_dir, exist_ok=True)
             
-            # Check if SQLite databases already exist for all time controls
-            all_exist = await self._check_all_databases_exist(month_str)
+            # Initialize tournament data structure
+            self.tournament_data = {}
+            for period_month in period_months:
+                self.tournament_data[period_month] = {
+                    "standard": [],
+                    "rapid": [],
+                    "blitz": []
+                }
+            
+            # Check if SQLite databases already exist for all target months
+            all_exist = await self._check_all_databases_exist(period_months, year)
             if all_exist:
-                logger.info(f"All tournament databases already exist for {month_str}")
+                logger.info(f"All tournament databases already exist for period {month_str}")
                 return True
             
             # Configure async session with higher limits for combined processing
@@ -88,7 +177,7 @@ class FIDETournamentScraper:
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 # Create tasks for all countries - each country processes completely independently
                 tasks = [
-                    self._process_country_tournaments(session, country, year, month)
+                    self._process_country_tournaments(session, country, year, month, period_months)
                     for country in countries
                 ]
                 
@@ -115,8 +204,8 @@ class FIDETournamentScraper:
                 logger.info(f"Results - Countries: {len(successful)} successful, {len(skipped)} skipped, {len(failed)} failed")
                 logger.info(f"Total tournaments processed: {total_tournaments}")
                 
-                # Create and upload SQLite databases
-                await self._create_and_upload_databases(month_str)
+                # Create and upload SQLite databases for each month
+                await self._create_and_upload_databases(period_months, year)
                 
                 # Log failures for debugging
                 if failed:
@@ -125,7 +214,7 @@ class FIDETournamentScraper:
                         logger.error(f"  {country}: {error}")
                 
                 # Upload completion marker
-                await self._upload_completion_marker(month_str, len(successful), len(failed), len(skipped), total_tournaments)
+                await self._upload_completion_marker(month_str, len(successful), len(failed), len(skipped), total_tournaments, period_months)
                 
                 return True
                 
@@ -133,25 +222,23 @@ class FIDETournamentScraper:
             logger.error(f"Error in tournament processing: {str(e)}", exc_info=True)
             raise
 
-    async def _check_all_databases_exist(self, month_str: str) -> bool:
-        """Check if SQLite databases already exist for all time controls"""
-        year, month = map(int, month_str.split("-"))
-        
+    async def _check_all_databases_exist(self, period_months: List[str], year: int) -> bool:
+        """Check if SQLite databases already exist for all time controls and months"""
         # Determine which time controls should exist based on year
         time_controls_to_check = ["standard"]
         if year >= 2012:
             time_controls_to_check.extend(["rapid", "blitz"])
         
-        for time_control in time_controls_to_check:
-            s3_key = f"persistent/tournament_data/processed/{time_control}/{month_str}.db"
-            if not await self._check_s3_file_exists_async(s3_key):
-                return False
+        for period_month in period_months:
+            for time_control in time_controls_to_check:
+                s3_key = f"persistent/tournament_data/processed/{time_control}/{period_month}.db"
+                if not await self._check_s3_file_exists_async(s3_key):
+                    return False
         
         return True
 
-    async def _process_country_tournaments(self, session: aiohttp.ClientSession, country: str, year: int, month: int):
+    async def _process_country_tournaments(self, session: aiohttp.ClientSession, country: str, year: int, month: int, period_months: List[str]):
         """Process all tournaments for a specific country - fetch tournament list then process each tournament"""
-        month_str = f"{month:02d}"
         
         async with self.country_semaphore:
             try:
@@ -164,7 +251,7 @@ class FIDETournamentScraper:
                 
                 # Step 2: Process all tournaments for this country in parallel
                 tasks = [
-                    self._process_single_tournament(session, tournament_id, country, year, month)
+                    self._process_single_tournament(session, tournament_id, country, year, month, period_months)
                     for tournament_id in tournament_ids
                 ]
                 
@@ -255,7 +342,40 @@ class FIDETournamentScraper:
             logger.error(f"Error processing tournament list for {country}: {str(e)}")
             return []
 
-    async def _process_single_tournament(self, session: aiohttp.ClientSession, tournament_id: str, country: str, year: int, month: int) -> bool:
+    async def _fetch_tournament_info(self, session: aiohttp.ClientSession, tournament_id: str) -> Tuple[Optional[str], Optional[str]]:
+        """Fetch tournament information to get date received and end date"""
+        url = f"{BASE_URL}/{TOURNAMENT_INFO_PATH}{tournament_id}"
+        
+        try:
+            async with session.get(url, timeout=30) as response:
+                response.raise_for_status()
+                text = await response.text()
+                soup = BeautifulSoup(text, "html.parser")
+                
+                date_received = None
+                end_date = None
+                
+                # Look for the details table
+                details_table = soup.find("table", {"class": "details_table"})
+                if details_table:
+                    for row in details_table.find_all("tr"):
+                        cells = row.find_all("td")
+                        if len(cells) >= 2:
+                            label = cells[0].get_text(strip=True).lower()
+                            value = cells[1].get_text(strip=True)
+                            
+                            if "date received" in label:
+                                date_received = value
+                            elif "end date" in label:
+                                end_date = value
+                
+                return date_received, end_date
+                
+        except Exception as e:
+            logger.warning(f"Failed to fetch tournament info for {tournament_id}: {str(e)}")
+            return None, None
+
+    async def _process_single_tournament(self, session: aiohttp.ClientSession, tournament_id: str, country: str, year: int, month: int, period_months: List[str]) -> bool:
         """Process a single tournament and add player data to cache"""
         url = f"{BASE_URL}/{TOURNAMENT_REPORT_PATH}{tournament_id}"
         
@@ -274,21 +394,36 @@ class FIDETournamentScraper:
                         player_data, time_control = await self._extract_player_data(soup)
 
                         if not player_data:
-                            # Not necessarily an error - tournament might have no players
+                            logger.warning(f"No player data found for tournament {tournament_id}")
                             return True
 
                         # Map time_control value to directory name
                         time_control_dirs = {"0": "standard", "1": "rapid", "2": "blitz"}
                         tc_dir = time_control_dirs.get(time_control, "standard")
 
+                        # For periods before August 2012, fetch additional tournament info to determine target month
+                        target_month = None
+                        if year < 2012 or (year == 2012 and month < 8):
+                            date_received, end_date = await self._fetch_tournament_info(session, tournament_id)
+                            
+                            if not date_received and not end_date:
+                                logger.warning(f"No date information found for tournament {tournament_id}")
+                            
+                            target_month = self.get_target_month_for_tournament(date_received, end_date, period_months)
+                            logger.debug(f"Tournament {tournament_id}: date_received={date_received}, end_date={end_date}, target_month={target_month}")
+                        else:
+                            # For monthly periods, use the single month
+                            target_month = period_months[0]
+
                         # Add tournament data to cache (thread-safe)
                         async with self.data_lock:
-                            for player_id, player_name in player_data:
-                                self.tournament_data[tc_dir].append({
-                                    'tournament_id': tournament_id,
-                                    'player_id': player_id,
-                                    'player_name': player_name
-                                })
+                            if target_month in self.tournament_data:
+                                for player_id, player_name in player_data:
+                                    self.tournament_data[target_month][tc_dir].append({
+                                        'tournament_id': tournament_id,
+                                        'player_id': player_id,
+                                        'player_name': player_name
+                                    })
                         
                         return True
 
@@ -339,23 +474,22 @@ class FIDETournamentScraper:
 
         return player_data, time_control
 
-    async def _create_and_upload_databases(self, month_str: str):
-        """Create SQLite databases for each time control and upload to S3"""
-        year, month = map(int, month_str.split("-"))
-        
+    async def _create_and_upload_databases(self, period_months: List[str], year: int):
+        """Create SQLite databases for each month and time control and upload to S3"""
         # Determine which time controls to create based on year
         time_controls_to_create = ["standard"]
-        if year >= 2012:
+        if year > 2012 or (year == 2012 and month >= 2):
             time_controls_to_create.extend(["rapid", "blitz"])
         
-        for time_control in time_controls_to_create:
-            if self.tournament_data[time_control]:
-                await self._create_time_control_database(time_control, month_str)
-            else:
-                logger.info(f"No data found for {time_control} time control")
+        for period_month in period_months:
+            for time_control in time_controls_to_create:
+                if self.tournament_data[period_month][time_control]:
+                    await self._create_time_control_database(time_control, period_month)
+                else:
+                    logger.info(f"No data found for {time_control} time control in {period_month}")
 
     async def _create_time_control_database(self, time_control: str, month_str: str):
-        """Create SQLite database for a specific time control"""
+        """Create SQLite database for a specific time control and month"""
         local_db_path = os.path.join(self.local_temp_dir, f"tournaments_{time_control}_{month_str}.db")
         
         try:
@@ -383,7 +517,7 @@ class FIDETournamentScraper:
             batch_size = 1000
             data_to_insert = [
                 (record['tournament_id'], record['player_id'], record['player_name'])
-                for record in self.tournament_data[time_control]
+                for record in self.tournament_data[month_str][time_control]
             ]
             
             for i in range(0, len(data_to_insert), batch_size):
@@ -396,7 +530,7 @@ class FIDETournamentScraper:
             conn.commit()
             conn.close()
             
-            logger.info(f"Created {time_control} database with {len(data_to_insert)} records")
+            logger.info(f"Created {time_control} database for {month_str} with {len(data_to_insert)} records")
             
             # Upload to S3
             s3_key = f"persistent/tournament_data/processed/{time_control}/{month_str}.db"
@@ -405,10 +539,10 @@ class FIDETournamentScraper:
             # Cleanup local file
             os.remove(local_db_path)
             
-            logger.info(f"Uploaded {time_control} database to {s3_key}")
+            logger.info(f"Uploaded {time_control} database for {month_str} to {s3_key}")
             
         except Exception as e:
-            logger.error(f"Error creating database for {time_control}: {str(e)}")
+            logger.error(f"Error creating database for {time_control} {month_str}: {str(e)}")
             if os.path.exists(local_db_path):
                 os.remove(local_db_path)
             raise
@@ -437,11 +571,21 @@ class FIDETournamentScraper:
             logger.error(f"Failed to upload to S3: {str(e)}")
             raise
 
-    async def _upload_completion_marker(self, month_str: str, successful: int, failed: int, skipped: int, total_tournaments: int):
+    async def _upload_completion_marker(self, month_str: str, successful: int, failed: int, skipped: int, total_tournaments: int, period_months: List[str]):
         """Upload completion marker with statistics"""
         try:
+            # Calculate database records per month and time control
+            database_info = {}
+            for period_month in period_months:
+                database_info[period_month] = {
+                    "standard_records": len(self.tournament_data[period_month]["standard"]),
+                    "rapid_records": len(self.tournament_data[period_month]["rapid"]),
+                    "blitz_records": len(self.tournament_data[period_month]["blitz"])
+                }
+            
             completion_data = {
                 "month": month_str,
+                "period_months": period_months,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "statistics": {
                     "countries_processed": len(countries),
@@ -450,13 +594,9 @@ class FIDETournamentScraper:
                     "countries_skipped": skipped,
                     "total_tournaments_processed": total_tournaments
                 },
-                "database_info": {
-                    "standard_records": len(self.tournament_data["standard"]),
-                    "rapid_records": len(self.tournament_data["rapid"]),
-                    "blitz_records": len(self.tournament_data["blitz"])
-                },
-                "step": "combined_tournament_processing",
-                "method": "aiohttp_parallel_sqlite"
+                "database_info": database_info,
+                "step": "combined_tournament_processing_multi_month",
+                "method": "aiohttp_parallel_sqlite_multi_month"
             }
             
             local_file = os.path.join(self.local_temp_dir, f"tournament_processing_completion_{month_str}.json")
@@ -473,7 +613,7 @@ class FIDETournamentScraper:
             logger.warning(f"Failed to upload completion marker: {str(e)}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape and process FIDE tournament data into SQLite databases.")
+    parser = argparse.ArgumentParser(description="Scrape and process FIDE tournament data into SQLite databases with multi-month support.")
     parser.add_argument(
         "--month",
         type=str,
@@ -496,7 +636,7 @@ def main():
 
     args = parser.parse_args()
     
-    logger.info(f"Starting combined tournament scraper for {args.month}")
+    logger.info(f"Starting enhanced tournament scraper for {args.month}")
     
     # Validate month format
     try:
@@ -516,14 +656,14 @@ def main():
         success = asyncio.run(scraper.process_tournaments_for_month(args.month))
         
         if success:
-            logger.info(f"Combined tournament processing completed successfully for {args.month}")
+            logger.info(f"Enhanced tournament processing completed successfully for {args.month}")
             return 0
         else:
-            logger.error("Combined tournament processing failed")
+            logger.error("Enhanced tournament processing failed")
             return 1
             
     except Exception as e:
-        logger.error(f"Combined tournament processing failed with error: {str(e)}", exc_info=True)
+        logger.error(f"Enhanced tournament processing failed with error: {str(e)}", exc_info=True)
         return 1
 
 if __name__ == "__main__":
