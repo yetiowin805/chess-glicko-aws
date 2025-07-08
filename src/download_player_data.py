@@ -70,7 +70,7 @@ class PlayerDataDownloader:
                 # Check if file already exists in S3
                 if self._check_s3_file_exists(s3_key):
                     logger.info(f"File exists in S3.")
-                    return None
+                    return [s3_key]
                 
                 # Download from FIDE website
                 success = self._download_from_fide(year, month, local_file)
