@@ -191,7 +191,8 @@ impl CalculationProcessor {
                 10 => vec![format!("{}-08", year), format!("{}-09", year), format!("{}-10", year)],
                 _ => vec![format!("{}-{:02}", year, month)],
             };
-            (months, months.len() > 1)
+            let is_multi = months.len() > 1;
+            (months, is_multi)
         } else if year < 2012 || (year == 2012 && month < 8) {
             // 2-month periods (odd months)
             if month % 2 == 1 {
@@ -202,7 +203,8 @@ impl CalculationProcessor {
                     7 => vec![format!("{}-06", year), format!("{}-07", year)],
                     _ => vec![format!("{}-{:02}", year, month)],
                 };
-                (months, months.len() > 1)
+                let is_multi = months.len() > 1;
+                (months, is_multi)
             } else {
                 (vec![format!("{}-{:02}", year, month)], false)
             }
@@ -552,7 +554,6 @@ impl CalculationProcessor {
             };
             
             // Skip if target month is not in our period
-            // This shouldn't happen
             if !self.period_months.contains(&target_month) {
                 return Err(anyhow::anyhow!(
                     "Tournament {} allocated to month {} which is not in period {:?}",
