@@ -37,7 +37,7 @@ const MAX_VOLATILITY: f64 = 0.1;
 const PI_SQUARED: f64 = std::f64::consts::PI * std::f64::consts::PI;
 
 #[derive(Parser, Debug)]
-#[command(name = "rating-processor")]
+#[command(name = "run-glicko")]
 #[command(about = "Process binary game data and update Glicko-2 ratings")]
 struct Args {
     #[arg(short, long, help = "Month for processing in YYYY-MM format")]
