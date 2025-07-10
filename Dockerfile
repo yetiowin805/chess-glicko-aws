@@ -16,16 +16,18 @@ COPY rust-src/Cargo.toml ./Cargo.toml
 # Create dummy files to match the binary targets in Cargo.toml
 RUN mkdir -p src && echo "fn main() {}" > src/scrape_calculations.rs
 RUN mkdir -p src && echo "fn main() {}" > src/process_calculations.rs
+RUN mkdir -p src && echo "fn main() {}" > src/glicko.rs
 
 # Build dependencies first (this layer will be cached)
-RUN cargo build --release && rm -rf src target/release/deps/calculation*
+RUN cargo build --release && rm -rf src target/release/deps/calculation* target/release/deps/run-glicko*
 
 # Now copy actual source code
 COPY rust-src/src ./src
 
-# Build both binaries
+# Build all three binaries
 RUN cargo build --release --bin calculation-scraper
 RUN cargo build --release --bin calculation-processor
+RUN cargo build --release --bin run-glicko
 
 # Main application stage
 FROM python:3.11-slim
@@ -53,16 +55,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy Python source code
 COPY src/ ./src/
 
-# Copy both compiled Rust binaries from builder stage
+# Copy all three compiled Rust binaries from builder stage
 COPY --from=rust-builder /rust-build/target/release/calculation-scraper ./bin/
 COPY --from=rust-builder /rust-build/target/release/calculation-processor ./bin/
+COPY --from=rust-builder /rust-build/target/release/run-glicko ./bin/
 
 # Make the Rust binaries executable and verify they exist
 RUN chmod +x ./bin/calculation-scraper && \
     chmod +x ./bin/calculation-processor && \
+    chmod +x ./bin/run-glicko && \
     ls -la ./bin/ && \
     ./bin/calculation-scraper --help || echo "calculation-scraper binary installed successfully" && \
-    ./bin/calculation-processor --help || echo "calculation-processor binary installed successfully"
+    ./bin/calculation-processor --help || echo "calculation-processor binary installed successfully" && \
+    ./bin/run-glicko --help || echo "run-glicko binary installed successfully"
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

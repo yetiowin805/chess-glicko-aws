@@ -173,22 +173,19 @@ run_post_scraping_pipeline() {
 
     log "Step 6 completed successfully"
 
-    # Step 7: Calculate Ratings (Future implementation)
-    log "Step 7: Calculating ratings..."
-    log "⚠️  Rating calculation step not yet implemented"
-    log "This step will:"
-    log "- Read processed calculation data"
-    log "- Apply Glicko-2 rating algorithm"
-    log "- Generate updated ratings for all players"
-    log "- Output rating changes and statistics"
-    
-    # Placeholder for rating calculation
-    # python src/calculate_ratings.py \
-    #     --month "$PROCESS_MONTH" \
-    #     --s3_bucket "$S3_BUCKET" \
-    #     --aws_region "$AWS_REGION"
-    
-    log "Step 7 placeholder completed"
+    # Step 7: Calculate Ratings
+    log "Step 7: Calculating ratings with Glicko-2 algorithm..."
+    run-glicko \
+        --month "$PROCESS_MONTH" \
+        --s3-bucket "$S3_BUCKET" \
+        --aws-region "$AWS_REGION"
+
+    if [ $? -ne 0 ]; then
+        log "ERROR: Rating calculation failed"
+        exit 1
+    fi
+
+    log "Step 7 completed successfully"
 
     # Step 8: Upload Results (Future implementation)
     log "Step 8: Uploading results..."
@@ -233,13 +230,13 @@ EOF
 4. Aggregated unique player IDs by time control
 5. Scraped individual player calculation data (games and results)
 6. Processed calculation data into compact binary format (Rust)
-7. Calculated ratings (placeholder)
+7. Calculated ratings using Glicko-2 algorithm (Rust)
 8. Uploaded results (placeholder)
 EOF
         else
             cat >> /tmp/completion.txt << EOF
 6. Processed calculation data into compact binary format (Rust)
-7. Calculated ratings (placeholder)
+7. Calculated ratings using Glicko-2 algorithm (Rust)
 8. Uploaded results (placeholder)
 
 Note: Steps 1-5 were skipped (post-scraping mode)
@@ -264,6 +261,9 @@ EOF
         cat >> /tmp/completion.txt << EOF
 - s3://$S3_BUCKET/persistent/calculations_processed/$PROCESS_MONTH/[time_control].bin.gz
 - s3://$S3_BUCKET/results/$PROCESS_MONTH/calculation_processing_completion.json
+- s3://$S3_BUCKET/persistent/ratings/$PROCESS_MONTH/[time_control].parquet
+- s3://$S3_BUCKET/persistent/top_ratings/$PROCESS_MONTH/[time_control]/[category].json
+- s3://$S3_BUCKET/results/$PROCESS_MONTH/rating_processing_completion.json
 
 Data structure:
 - Tournament data is organized by time control (standard/rapid/blitz)
@@ -272,6 +272,9 @@ Data structure:
 - Calculation files contain detailed game data and results for each player
 - Processed calculations are in compact binary format optimized for rating calculations
 - Player data is processed and ready for rating calculations
+- Ratings are stored in Parquet format with rating, RD, and volatility values for each player
+- Top rating lists contain ranked lists by category (open, women, juniors, girls) with player details
+- All rating data uses Glicko-2 algorithm with proper uncertainty and volatility tracking
 EOF
         
         aws s3 cp /tmp/completion.txt "s3://$S3_BUCKET/results/$PROCESS_MONTH/completion_${mode}.txt"
@@ -306,9 +309,9 @@ if [ -n "$SNS_TOPIC_ARN" ]; then
     message="Chess Rating Pipeline ($PIPELINE_MODE mode) completed successfully for $PROCESS_MONTH."
     
     if [ "$PIPELINE_MODE" = "full" ]; then
-        message="$message Downloaded player data, processed it, scraped/processed tournament data in parallel, aggregated unique player IDs by time control, scraped individual player calculation data, and processed calculations into binary format."
+        message="$message Downloaded player data, processed it, scraped/processed tournament data in parallel, aggregated unique player IDs by time control, scraped individual player calculation data, processed calculations into binary format, and calculated ratings using Glicko-2 algorithm."
     else
-        message="$message Processed calculation data into binary format and prepared for rating calculations."
+        message="$message Processed calculation data into binary format and calculated ratings using Glicko-2 algorithm."
     fi
     
     aws sns publish \

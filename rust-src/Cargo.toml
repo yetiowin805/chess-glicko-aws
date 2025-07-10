@@ -1,5 +1,5 @@
 [package]
-name = "calculation-scraper"
+name = "chess-rating-system"
 version = "0.1.0"
 edition = "2021"
 
@@ -10,6 +10,10 @@ path = "src/scrape_calculations.rs"
 [[bin]]
 name = "calculation-processor"
 path = "src/process_calculations.rs"
+
+[[bin]]
+name = "run-glicko"
+path = "src/glicko.rs"
 
 [dependencies]
 # Async runtime
@@ -57,3 +61,13 @@ hashbrown = "0.14"
 
 # SQLite support
 rusqlite = { version = "0.30", features = ["bundled"] }
+
+# Parallel processing
+rayon = "1.7"
+
+# Arrow/Parquet support
+arrow = { version = "53.0", features = ["csv", "json"] }
+parquet = { version = "53.0", features = ["arrow"] }
+
+# Additional math utilities
+libm = "0.2"
