@@ -12,6 +12,11 @@ use tokio::fs;
 use tracing::{error, info, warn};
 use regex::Regex;
 use rusqlite::{Connection, Result as SqliteResult};
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use flate2::read::GzDecoder;
+use std::io::Read;
+use std::io::Write;
 
 // Binary format constants
 const MAGIC_HEADER: &[u8; 8] = b"CHSSGAME";
@@ -123,6 +128,7 @@ struct PlayerMappings {
 // Tournament mapping cache
 struct TournamentMappings {
     tournament_to_month: HashMap<String, String>, // tournament_id -> target_month
+    database_path: PathBuf, // Path to the tournament database file for fallback queries
 }
 
 // Multi-month processed data
@@ -292,11 +298,7 @@ impl CalculationProcessor {
         
         // Load all required data into memory
         let player_mappings = self.load_player_database(time_control).await?;
-        let tournament_mappings = if self.is_multi_month {
-            Some(self.load_tournament_databases(time_control).await?)
-        } else {
-            None
-        };
+        let tournament_mappings = self.load_tournament_databases(time_control).await?;
         
         // Download and process JSONL file
         let local_jsonl_path = self.temp_dir.join(format!("{}.jsonl", time_control));
@@ -305,7 +307,7 @@ impl CalculationProcessor {
         let (processed_data, stats) = self.process_jsonl_file(
             &local_jsonl_path, 
             &player_mappings, 
-            tournament_mappings.as_ref()
+            Some(&tournament_mappings)
         ).await?;
         
         // Clean up JSONL file
@@ -328,6 +330,10 @@ impl CalculationProcessor {
             }
         }
         
+        // Clean up tournament database
+        self.cleanup_tournament_database(&tournament_mappings).await
+            .unwrap_or_else(|e| warn!("Failed to cleanup tournament database: {}", e));
+        
         info!("{}: Processing completed - {:?}", time_control, stats);
         Ok(stats)
     }
@@ -336,6 +342,7 @@ impl CalculationProcessor {
         info!("Loading tournament databases for {}", time_control);
         
         let mut tournament_to_month = HashMap::new();
+        let mut database_path = PathBuf::new();
         
         // Load tournament database for this time control
         let s3_key = format!("persistent/tournament_data/processed/{}/{}.db", 
@@ -344,6 +351,8 @@ impl CalculationProcessor {
         
         self.download_file(&s3_key, &local_db_path).await
             .context("Failed to download tournament database")?;
+        
+        database_path = local_db_path.clone();
         
         // Load tournament mappings from SQLite database
         let mappings = tokio::task::spawn_blocking({
@@ -376,11 +385,9 @@ impl CalculationProcessor {
         
         tournament_to_month.extend(mappings);
         
-        // Clean up database file
-        fs::remove_file(&local_db_path).await?;
-        
         Ok(TournamentMappings {
             tournament_to_month,
+            database_path,
         })
     }
 
@@ -570,12 +577,23 @@ impl CalculationProcessor {
                 }
                 
                 let score = self.convert_result_to_score(&game.result)?;
-                let opponent_id = self.get_player_id_from_name(opponent_name, player_mappings);
+                let mut opponent_id = self.get_player_id_from_name(opponent_name, player_mappings);
+                
+                // Fallback: try to find opponent in tournament data if not found in player mappings
+                if opponent_id.is_none() {
+                    if let Some(mappings) = tournament_mappings {
+                        opponent_id = self.find_opponent_in_tournament_data(
+                            opponent_name, 
+                            &tournament.tournament_id, 
+                            mappings
+                        ).await;
+                    }
+                }
                 
                 let opponent_id_hash = match opponent_id {
                     Some(id) => self.hash_string(&id),
                     None => {
-                        warn!("Could not resolve opponent ID for '{}' in tournament {}, player {}", 
+                        warn!("Could not resolve opponent ID for '{}' in tournament {}, player {} (tried both player mappings and tournament fallback)", 
                               opponent_name, tournament.tournament_id, player_record.player_id);
                         continue;
                     }
@@ -676,6 +694,67 @@ impl CalculationProcessor {
         None
     }
 
+    async fn find_opponent_in_tournament_data(
+        &self, 
+        opponent_name: &str, 
+        tournament_id: &str, 
+        tournament_mappings: &TournamentMappings
+    ) -> Option<String> {
+        if opponent_name.is_empty() {
+            return None;
+        }
+        
+        let database_path = &tournament_mappings.database_path;
+        if !database_path.exists() {
+            warn!("Tournament database not found: {:?}", database_path);
+            return None;
+        }
+        
+        // Query the tournament database for this specific tournament and opponent name
+        let result = tokio::task::spawn_blocking({
+            let database_path = database_path.clone();
+            let opponent_name = opponent_name.to_string();
+            let tournament_id = tournament_id.to_string();
+            move || -> Option<String> {
+                match Connection::open(&database_path) {
+                    Ok(conn) => {
+                        // Try exact match first (case-insensitive)
+                        let mut stmt = conn.prepare(
+                            "SELECT player_id FROM tournament_players 
+                             WHERE tournament_id = ? AND LOWER(player_name) = LOWER(?) 
+                             LIMIT 1"
+                        ).ok()?;
+                        
+                        let result = stmt.query_row([&tournament_id, &opponent_name], |row| {
+                            row.get::<_, String>(0)
+                        }).ok();
+                        
+                        if result.is_some() {
+                            return result;
+                        }
+                        
+                        None
+                    }
+                    Err(e) => {
+                        warn!("Failed to open tournament database: {}", e);
+                        None
+                    }
+                }
+            }
+        }).await;
+        
+        match result {
+            Ok(Some(player_id)) => {
+                Some(player_id)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!("Error querying tournament database: {}", e);
+                None
+            }
+        }
+    }
+
     fn hash_string(&self, s: &str) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -774,7 +853,7 @@ impl CalculationProcessor {
 
     async fn compress_file(&self, input_path: &PathBuf, output_path: &PathBuf) -> Result<()> {
         let input = fs::read(input_path).await?;
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&input)?;
         let compressed = encoder.finish()?;
         fs::write(output_path, compressed).await?;
@@ -842,6 +921,14 @@ impl CalculationProcessor {
         
         fs::remove_file(&local_file).await?;
         info!("Uploaded processing completion marker for {}", self.month_str);
+        Ok(())
+    }
+
+    async fn cleanup_tournament_database(&self, tournament_mappings: &TournamentMappings) -> Result<()> {
+        if tournament_mappings.database_path.exists() {
+            fs::remove_file(&tournament_mappings.database_path).await?;
+            info!("Cleaned up tournament database: {:?}", tournament_mappings.database_path);
+        }
         Ok(())
     }
 }
