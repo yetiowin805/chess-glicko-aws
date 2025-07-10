@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use tokio::fs;
 use tracing::{error, info, warn};
@@ -15,8 +15,6 @@ use rusqlite::{Connection, Result as SqliteResult};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use flate2::read::GzDecoder;
-use std::io::Read;
-use std::io::Write;
 
 // Binary format constants
 const MAGIC_HEADER: &[u8; 8] = b"CHSSGAME";
