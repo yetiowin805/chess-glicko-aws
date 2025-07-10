@@ -235,6 +235,10 @@ resource "aws_ecs_task_definition" "chess_pipeline" {
         {
           name  = "SNS_TOPIC_ARN"
           value = aws_sns_topic.notifications.arn
+        },
+        {
+          name  = "RUST_LOG"
+          value = "info"
         }
       ]
       
