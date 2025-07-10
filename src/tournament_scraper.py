@@ -81,6 +81,10 @@ class FIDETournamentScraper:
                     return [f"{year}-04", f"{year}-05"]
                 if month == 7:
                     return [f"{year}-06", f"{year}-07"]
+                if month == 9:
+                    return [f"{year}-08", f"{year}-09"]
+                if month == 11:
+                    return [f"{year}-10", f"{year}-11"]
         else:
             # Monthly periods
             return [f"{year}-{month:02d}"]

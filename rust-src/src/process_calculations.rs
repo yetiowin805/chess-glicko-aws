@@ -201,6 +201,8 @@ impl CalculationProcessor {
                     3 => vec![format!("{}-02", year), format!("{}-03", year)],
                     5 => vec![format!("{}-04", year), format!("{}-05", year)],
                     7 => vec![format!("{}-06", year), format!("{}-07", year)],
+                    9 => vec![format!("{}-08", year), format!("{}-09", year)],
+                    11 => vec![format!("{}-10", year), format!("{}-11", year)],
                     _ => vec![format!("{}-{:02}", year, month)],
                 };
                 let is_multi = months.len() > 1;
