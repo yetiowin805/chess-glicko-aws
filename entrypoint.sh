@@ -194,13 +194,36 @@ run_glicko_only_pipeline() {
     log "  --s3-bucket $S3_BUCKET"
     log "  --aws-region $AWS_REGION"
     
-    run-glicko \
+    # Test if binary can execute at all
+    log "Testing binary execution..."
+    if ! /app/bin/run-glicko --help >/dev/null 2>&1; then
+        log "ERROR: run-glicko binary cannot execute - checking dependencies..."
+        ldd /app/bin/run-glicko || log "ldd failed"
+        file /app/bin/run-glicko || log "file failed"
+        exit 1
+    fi
+    
+    log "Binary test passed, running with full parameters..."
+    
+    # Capture both stdout and stderr
+    set +e  # Don't exit on error
+    output=$(run-glicko \
         --month "$PROCESS_MONTH" \
         --s3-bucket "$S3_BUCKET" \
-        --aws-region "$AWS_REGION"
+        --aws-region "$AWS_REGION" 2>&1)
+    exit_code=$?
+    set -e  # Re-enable exit on error
+    
+    log "run-glicko exit code: $exit_code"
+    if [ -n "$output" ]; then
+        log "run-glicko output:"
+        echo "$output"
+    else
+        log "run-glicko produced no output"
+    fi
 
-    if [ $? -ne 0 ]; then
-        log "ERROR: Rating calculation failed"
+    if [ $exit_code -ne 0 ]; then
+        log "ERROR: Rating calculation failed with exit code $exit_code"
         exit 1
     fi
 
