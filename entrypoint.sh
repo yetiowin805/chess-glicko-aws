@@ -205,25 +205,51 @@ run_glicko_only_pipeline() {
     
     log "Binary test passed, running with full parameters..."
     
-    # Set Rust logging level to info
-    export RUST_LOG=info
+    # Set multiple Rust logging levels
+    export RUST_LOG=debug
+    export RUST_BACKTRACE=1
     
-    # Capture both stdout and stderr
+    log "Environment variables set:"
+    log "  RUST_LOG=$RUST_LOG"
+    log "  RUST_BACKTRACE=$RUST_BACKTRACE"
+    
+    # Try a more verbose approach - run directly with strace to see what's happening
+    log "Attempting to trace system calls..."
+    
+    # First try with timeout to prevent hanging
+    log "Running with 30 second timeout..."
     set +e  # Don't exit on error
-    output=$(run-glicko \
+    if timeout 30 strace -o /tmp/strace.log -e trace=write,openat,execve run-glicko \
         --month "$PROCESS_MONTH" \
         --s3-bucket "$S3_BUCKET" \
-        --aws-region "$AWS_REGION" 2>&1)
-    exit_code=$?
+        --aws-region "$AWS_REGION" > /tmp/run-glicko.out 2>&1; then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
     set -e  # Re-enable exit on error
     
     log "run-glicko exit code: $exit_code"
-    if [ -n "$output" ]; then
-        log "run-glicko output:"
-        echo "$output"
-    else
-        log "run-glicko produced no output"
+    
+    # Show output files
+    if [ -f /tmp/run-glicko.out ]; then
+        output_size=$(wc -c < /tmp/run-glicko.out)
+        log "Output file size: $output_size bytes"
+        if [ $output_size -gt 0 ]; then
+            log "run-glicko output:"
+            cat /tmp/run-glicko.out
+        else
+            log "Output file is empty"
+        fi
     fi
+    
+    if [ -f /tmp/strace.log ]; then
+        log "System call trace (last 20 lines):"
+        tail -20 /tmp/strace.log
+    fi
+    
+    # Cleanup
+    rm -f /tmp/run-glicko.out /tmp/strace.log
 
     if [ $exit_code -ne 0 ]; then
         log "ERROR: Rating calculation failed with exit code $exit_code"
