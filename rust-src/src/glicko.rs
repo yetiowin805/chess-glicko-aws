@@ -112,7 +112,7 @@ struct PlayerInfo {
     name: String,
     federation: String,
     sex: String,
-    birth_year: u32,
+    birth_year: Option<u32>, // Changed to Option<u32> to handle NULL values
 }
 
 #[derive(Debug, Serialize)]
@@ -120,7 +120,7 @@ struct TopRatingEntry {
     rank: u32,
     name: String,
     federation: String,
-    birth_year: u32,
+    birth_year: Option<u32>, // Changed to Option<u32> to handle NULL values
     sex: Option<String>, // None for women/girls categories
     rating: f64,
     rd: f64,
@@ -612,12 +612,16 @@ impl RatingProcessor {
                 
                 let mut player_info = HashMap::new();
                 let player_iter = stmt.query_map([], |row| {
+                    // Handle NULL birth_year gracefully
+                    let birth_year_result: Result<u32, _> = row.get(4);
+                    let birth_year = birth_year_result.ok(); // Convert error to None
+                    
                     Ok(PlayerInfo {
                         id: row.get(0)?,
                         name: row.get(1)?,
                         federation: row.get(2)?,
                         sex: row.get(3)?,
-                        birth_year: row.get(4)?,
+                        birth_year,
                     })
                 }).context("Failed to execute player info query")?;
                 
@@ -747,10 +751,11 @@ impl RatingProcessor {
                 info.map_or(false, |i| i.sex == "F")
             })),
             ("juniors", Box::new(move |_p: &Player, info: Option<&PlayerInfo>| {
-                info.map_or(false, |i| year - i.birth_year as i32 <= 20)
+                info.and_then(|i| i.birth_year).map_or(false, |birth_year| year - birth_year as i32 <= 20)
             })),
             ("girls", Box::new(move |_p: &Player, info: Option<&PlayerInfo>| {
-                info.map_or(false, |i| i.sex == "F" && year - i.birth_year as i32 <= 20)
+                info.map_or(false, |i| i.sex == "F" && 
+                    i.birth_year.map_or(false, |birth_year| year - birth_year as i32 <= 20))
             })),
         ];
         
@@ -768,7 +773,7 @@ impl RatingProcessor {
                         rank,
                         name: info.map_or_else(|| "".to_string(), |i| i.name.clone()),
                         federation: info.map_or_else(|| "".to_string(), |i| i.federation.clone()),
-                        birth_year: info.map_or(0, |i| i.birth_year),
+                        birth_year: info.and_then(|i| i.birth_year),
                         sex: if category == "women" || category == "girls" { 
                             None 
                         } else { 
@@ -957,4 +962,3 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     }
-}
