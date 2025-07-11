@@ -355,6 +355,7 @@ impl CalculationProcessor {
         // Load tournament mappings from SQLite database
         let mappings = tokio::task::spawn_blocking({
             let local_db_path = local_db_path.clone();
+            let is_multi_month = self.is_multi_month;
             let month_str = self.month_str.clone();
             move || -> Result<HashMap<String, String>> {
                 let conn = Connection::open(&local_db_path)
@@ -362,7 +363,7 @@ impl CalculationProcessor {
                 
                 let mut mappings = HashMap::new();
                 
-                if self.is_multi_month {
+                if is_multi_month {
                     // Multi-month periods: tournament files have target_month field
                     let mut stmt = conn.prepare("SELECT tournament_id, target_month FROM tournament_players")
                         .context("Failed to prepare tournament query")?;
