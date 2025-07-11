@@ -962,3 +962,4 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     }
+}
