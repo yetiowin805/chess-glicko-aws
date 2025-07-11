@@ -1071,13 +1071,6 @@ impl RatingProcessor {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging with more detailed format
-    info!("🚀 Starting Rating Processor");
-    info!("📋 Configuration:");
-    info!("  - Month: {}", args.month);
-    info!("  - S3 Bucket: {}", args.s3_bucket);
-    info!("  - AWS Region: {}", args.aws_region);
-    info!("  - Workers: {}", args.workers);
     tracing_subscriber::fmt()
         .with_target(false)
         .with_thread_ids(true)
