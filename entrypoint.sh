@@ -205,6 +205,9 @@ run_glicko_only_pipeline() {
     
     log "Binary test passed, running with full parameters..."
     
+    # Set Rust logging level to info
+    export RUST_LOG=info
+    
     # Capture both stdout and stderr
     set +e  # Don't exit on error
     output=$(run-glicko \
