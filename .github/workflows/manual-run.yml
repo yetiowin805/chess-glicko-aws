@@ -27,6 +27,7 @@ on:
         options:
         - 'full'
         - 'post_scraping'
+        - 'glicko_only'
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
@@ -219,13 +220,19 @@ jobs:
           echo "  - Upload results to S3"
           ESTIMATED_TIME_PER_MONTH=17
           echo "  ⚠️  Expected duration per month: 15-20 minutes"
-        else
+        elif [ "${{ github.event.inputs.pipeline_mode }}" = "post_scraping" ]; then
           echo "📊 Post-scraping pipeline will run for each month:"
           echo "  - Process calculation data"
           echo "  - Calculate Glicko ratings"
           echo "  - Upload results to S3"
           ESTIMATED_TIME_PER_MONTH=3
           echo "  ⚠️  Expected duration per month: 2-5 minutes"
+        else
+          echo "📊 Glicko-only pipeline will run for each month:"
+          echo "  - Calculate Glicko ratings only"
+          echo "  - Upload rating results to S3"
+          ESTIMATED_TIME_PER_MONTH=1
+          echo "  ⚠️  Expected duration per month: 1-2 minutes"
         fi
         
         TOTAL_ESTIMATED_TIME=$((ESTIMATED_TIME_PER_MONTH * MONTH_COUNT))
@@ -359,3 +366,4 @@ jobs:
         else
           echo "🎉 All months processed successfully!"
         fi
+  

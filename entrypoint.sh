@@ -173,6 +173,13 @@ run_post_scraping_pipeline() {
 
     log "Step 6 completed successfully"
 
+    run_glicko_only_pipeline
+}
+
+# Function to run glicko-only pipeline
+run_glicko_only_pipeline() {
+    log "Running Glicko steps..."
+    
     # Step 7: Calculate Ratings
     log "Step 7: Calculating ratings with Glicko-2 algorithm..."
     run-glicko \
@@ -233,13 +240,20 @@ EOF
 7. Calculated ratings using Glicko-2 algorithm (Rust)
 8. Uploaded results (placeholder)
 EOF
-        else
+        elif [ "$mode" = "post_scraping" ]; then
             cat >> /tmp/completion.txt << EOF
 6. Processed calculation data into compact binary format (Rust)
 7. Calculated ratings using Glicko-2 algorithm (Rust)
 8. Uploaded results (placeholder)
 
 Note: Steps 1-5 were skipped (post-scraping mode)
+EOF
+        else
+            cat >> /tmp/completion.txt << EOF
+7. Calculated ratings using Glicko-2 algorithm (Rust)
+8. Uploaded results (placeholder)
+
+Note: Steps 1-6 were skipped (glicko-only mode)
 EOF
         fi
         
@@ -297,9 +311,16 @@ case "$PIPELINE_MODE" in
         upload_completion_marker "post_scraping" "success"
         log "Post-scraping Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
         ;;
+    "glicko_only")
+        log "Starting Glicko-only pipeline mode..."
+        validate_post_scraping_data
+        run_glicko_only_pipeline
+        upload_completion_marker "glicko_only" "success"
+        log "Glicko-only Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
+        ;;
     *)
         log "ERROR: Invalid PIPELINE_MODE: $PIPELINE_MODE"
-        log "Valid modes: full, post_scraping"
+        log "Valid modes: full, post_scraping, glicko_only"
         exit 1
         ;;
 esac
@@ -310,8 +331,10 @@ if [ -n "$SNS_TOPIC_ARN" ]; then
     
     if [ "$PIPELINE_MODE" = "full" ]; then
         message="$message Downloaded player data, processed it, scraped/processed tournament data in parallel, aggregated unique player IDs by time control, scraped individual player calculation data, processed calculations into binary format, and calculated ratings using Glicko-2 algorithm."
-    else
+    elif [ "$PIPELINE_MODE" = "post_scraping" ]; then
         message="$message Processed calculation data into binary format and calculated ratings using Glicko-2 algorithm."
+    else
+        message="$message Calculated ratings using Glicko-2 algorithm only."
     fi
     
     aws sns publish \
