@@ -1071,6 +1071,8 @@ impl RatingProcessor {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    println!("hello from run-glicko main");
+    
     tracing_subscriber::fmt()
         .with_target(false)
         .with_thread_ids(true)
