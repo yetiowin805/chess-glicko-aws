@@ -123,12 +123,9 @@ class PlayerDataDownloader:
                 extracted_file = os.path.join(self.local_temp_dir, f"{zip_header}frl.txt")
                 if os.path.exists(extracted_file):
                     os.rename(extracted_file, local_file)
-                else:
-                    # Sometimes the file structure is different
-                    for file in zip_ref.namelist():
-                        if file.endswith('.txt'):
-                            os.rename(os.path.join(self.local_temp_dir, file), local_file)
-                            break
+                extracted_file = os.path.join(self.local_temp_dir, f"{zip_header}FRL.TXT")
+                if os.path.exists(extracted_file):
+                    os.rename(extracted_file, local_file)
             
             # Cleanup
             os.remove(zip_path)
