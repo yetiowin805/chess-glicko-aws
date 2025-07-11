@@ -232,17 +232,45 @@ class FIDEDataProcessor:
     
     def _convert_data_types(self, parts, keys):
         """Convert string data to appropriate types"""
+        # Determine if this is a format where sex needs to be extracted from flag
+        needs_sex_extraction = "sex" in keys and len(parts) == len(keys) - 1
+        
         converted = []
-        for i, (part, key) in enumerate(zip(parts, keys)):
-            if key in ['rating', 'games', 'b_year', 'k']:
-                # Convert to integer, handle empty strings
-                try:
-                    converted.append(int(part) if part else None)
-                except ValueError:
-                    converted.append(None)
+        parts_index = 0
+        
+        for i, key in enumerate(keys):
+            if key == "sex" and needs_sex_extraction:
+                # Extract sex from flag field - flag should be the previous field
+                flag_index = keys.index("flag") if "flag" in keys else -1
+                if flag_index >= 0 and flag_index < len(parts):
+                    flag_value = parts[flag_index] if parts[flag_index] else ""
+                    # Player is female (F) if flag contains 'w', otherwise male (M)
+                    sex_value = "F" if "w" in flag_value.lower() else "M"
+                    converted.append(sex_value)
+                else:
+                    converted.append("M")  # Default to male if flag not found
+                # Don't increment parts_index since we're extracting from existing data
             else:
-                # Keep as string, but convert empty strings to None for cleaner data
-                converted.append(part if part else None)
+                # Normal field processing
+                if parts_index < len(parts):
+                    part = parts[parts_index]
+                    if key in ['rating', 'games', 'b_year', 'k']:
+                        # Convert to integer, handle empty strings
+                        try:
+                            converted.append(int(part) if part else None)
+                        except ValueError:
+                            converted.append(None)
+                    else:
+                        # Keep as string, but convert empty strings to None for cleaner data
+                        converted.append(part if part else None)
+                    parts_index += 1
+                else:
+                    # Handle missing data
+                    if key in ['rating', 'games', 'b_year', 'k']:
+                        converted.append(None)
+                    else:
+                        converted.append(None)
+        
         return converted
     
     def _process_line(self, line, lengths):
@@ -264,7 +292,7 @@ class FIDEDataProcessor:
             if month <= 4:
                 return (
                     [10, 33, 6, 8, 6, 6, 11, 4],
-                    ["id", "name", "title", "fed", "rating", "games", "b_year", "flag"],
+                    ["id", "name", "title", "fed", "rating", "games", "b_year", "flag", "sex"],
                 )
             else:
                 return (
@@ -300,17 +328,17 @@ class FIDEDataProcessor:
                 )
             return (
                 [10, 33, 6, 8, 6, 6, 11, 6],
-                ["id", "name", "title", "fed", "rating", "games", "b_year", "flag"],
+                ["id", "name", "title", "fed", "rating", "games", "b_year", "flag", "sex"],
             )
         if year < 2005 or (year == 2005 and month <= 7):
             return (
                 [9, 32, 6, 8, 6, 5, 11, 4],
-                ["id", "name", "title", "fed", "rating", "games", "b_year", "flag"],
+                ["id", "name", "title", "fed", "rating", "games", "b_year", "flag", "sex"],
             )
         if year < 2012 or (year == 2012 and month <= 8):
             return (
                 [10, 32, 6, 4, 6, 4, 6, 4],
-                ["id", "name", "title", "fed", "rating", "games", "b_year", "flag"],
+                ["id", "name", "title", "fed", "rating", "games", "b_year", "flag", "sex"],
             )
         if year < 2016 or (year == 2016 and month <= 8):
             return (
