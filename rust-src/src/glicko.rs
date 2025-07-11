@@ -557,6 +557,14 @@ impl RatingProcessor {
         let delta = v * delta_sum;
         
         let a  = (player.volatility * player.volatility).ln();   // ln σ²  (σ ≡ volatility)
+
+        let f = |x: f64| {
+            let exp_x = x.exp();
+            (exp_x * (delta * delta - phi * phi - v - exp_x))
+                / (2.0 * (phi * phi + v + exp_x).powi(2))
+                - (x - a) / (TAU * TAU)
+        };
+
         let mut A = a;
         let mut B;
 
@@ -567,23 +575,13 @@ impl RatingProcessor {
             // Move downward until f(B) < 0
             let mut k = 1.0;
             loop {
-                B = a - k * TAU;
-                let exp_b   = B.exp();
-                let f_b = (exp_b * (delta * delta - phi * phi - v - exp_b))
-                        / (2.0 * (phi * phi + v + exp_b).powi(2))
-                        - (B - a) / (TAU * TAU);
-                if f_b < 0.0 { break; }
+                if f(a - k * TAU) < 0.0 {
+                    break;
+                }
                 k += 1.0;
             }
+            B = a - k * TAU;
         }
-
-        // Helper lambdas kept local
-        let f = |x: f64| {
-            let exp_x = x.exp();
-            (exp_x * (delta * delta - phi * phi - v - exp_x))
-                / (2.0 * (phi * phi + v + exp_x).powi(2))
-                - (x - a) / (TAU * TAU)
-        };
 
         let mut f_a = f(A);
         let mut f_b = f(B);
