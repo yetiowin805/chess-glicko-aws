@@ -205,46 +205,74 @@ run_glicko_only_pipeline() {
     
     log "Binary test passed, running with full parameters..."
     
-    # Set Rust logging levels
-    export RUST_LOG=debug
-    export RUST_BACKTRACE=1
+    # Set Rust logging levels and force output
+    export RUST_LOG=trace
+    export RUST_BACKTRACE=full
+    export RUST_LOG_STYLE=always
     
     log "Environment variables set:"
     log "  RUST_LOG=$RUST_LOG"
     log "  RUST_BACKTRACE=$RUST_BACKTRACE"
+    log "  RUST_LOG_STYLE=$RUST_LOG_STYLE"
     
-    # Simplified approach - just capture the error directly
-    log "Running run-glicko and capturing output..."
+    # Check temp directory before and after
+    log "Temp directory before execution:"
+    ls -la /tmp/ | head -10
+    
+    # Monitor the run
+    log "Running run-glicko and capturing ALL output..."
     set +e  # Don't exit on error
     
-    # Run without timeout first to get the actual error
-    output=$(run-glicko \
+    # Redirect both stdout and stderr explicitly
+    exec 3>&1 4>&2  # Save original stdout and stderr
+    
+    start_time=$(date +%s)
+    
+    run-glicko \
         --month "$PROCESS_MONTH" \
         --s3-bucket "$S3_BUCKET" \
-        --aws-region "$AWS_REGION" 2>&1)
-    exit_code=$?
+        --aws-region "$AWS_REGION" \
+        1> >(tee /tmp/run-glicko-stdout.log >&3) \
+        2> >(tee /tmp/run-glicko-stderr.log >&4)
     
+    exit_code=$?
+    end_time=$(date +%s)
+    runtime=$((end_time - start_time))
+    
+    exec 3>&- 4>&-  # Close the saved descriptors
     set -e  # Re-enable exit on error
     
-    log "run-glicko exit code: $exit_code"
-    if [ -n "$output" ]; then
-        log "run-glicko output:"
-        echo "$output"
-        log "--- End of output ---"
-    else
-        log "run-glicko produced no output"
+    log "run-glicko completed in ${runtime} seconds with exit code: $exit_code"
+    
+    # Check output files
+    if [ -f /tmp/run-glicko-stdout.log ]; then
+        stdout_size=$(wc -c < /tmp/run-glicko-stdout.log)
+        log "STDOUT size: $stdout_size bytes"
+        if [ $stdout_size -gt 0 ]; then
+            log "STDOUT content:"
+            cat /tmp/run-glicko-stdout.log
+        fi
     fi
     
-    # Check binary dependencies if it failed
-    if [ $exit_code -eq 127 ]; then
-        log "Exit code 127 indicates command not found or missing dependency"
-        log "Checking binary dependencies:"
-        ldd /app/bin/run-glicko || log "ldd command failed"
-        log "Checking if binary is executable:"
-        file /app/bin/run-glicko || log "file command failed"
-        log "Trying to run binary directly:"
-        /app/bin/run-glicko --help || log "Direct execution failed with code: $?"
+    if [ -f /tmp/run-glicko-stderr.log ]; then
+        stderr_size=$(wc -c < /tmp/run-glicko-stderr.log)
+        log "STDERR size: $stderr_size bytes"
+        if [ $stderr_size -gt 0 ]; then
+            log "STDERR content:"
+            cat /tmp/run-glicko-stderr.log
+        fi
     fi
+    
+    # Check temp directory after
+    log "Temp directory after execution:"
+    ls -la /tmp/ | head -10
+    
+    # Check if any new files were created
+    log "New files in temp (if any):"
+    find /tmp -newer /tmp/run-glicko-stdout.log 2>/dev/null || log "No new files found"
+    
+    # Cleanup
+    rm -f /tmp/run-glicko-stdout.log /tmp/run-glicko-stderr.log
 
     if [ $exit_code -ne 0 ]; then
         log "ERROR: Rating calculation failed with exit code $exit_code"
