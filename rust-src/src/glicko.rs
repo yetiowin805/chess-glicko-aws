@@ -36,6 +36,7 @@ const TAU: f64 = 0.2;
 const SCALE: f64 = 173.7178;
 const MAX_RD: f64 = 500.0;
 const MAX_VOLATILITY: f64 = 0.1;
+const EPS: f64 = 1e-6;
 const PI_SQUARED: f64 = std::f64::consts::PI * std::f64::consts::PI;
 
 #[derive(Parser, Debug)]
