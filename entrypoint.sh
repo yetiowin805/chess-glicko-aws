@@ -7,6 +7,57 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
+# Function to check if a month is a valid FIDE rating period
+is_valid_rating_period() {
+    local year=$1
+    local month=$2
+    
+    if [ "$year" -lt 2009 ]; then
+        # Quarterly periods: Jan, Apr, Jul, Oct
+        case "$month" in
+            1|4|7|10) return 0 ;;
+            *) return 1 ;;
+        esac
+    elif [ "$year" -eq 2009 ]; then
+        if [ "$month" -lt 9 ]; then
+            # First half of 2009: Jan, Apr, Jul
+            case "$month" in
+                1|4|7) return 0 ;;
+                *) return 1 ;;
+            esac
+        else
+            # Second half of 2009: odd months (Sep, Nov)
+            if [ $((month % 2)) -eq 1 ]; then
+                return 0
+            else
+                return 1
+            fi
+        fi
+    elif [ "$year" -lt 2012 ]; then
+        # Odd months only
+        if [ $((month % 2)) -eq 1 ]; then
+            return 0
+        else
+            return 1
+        fi
+    elif [ "$year" -eq 2012 ]; then
+        if [ "$month" -lt 8 ]; then
+            # First half of 2012: odd months
+            if [ $((month % 2)) -eq 1 ]; then
+                return 0
+            else
+                return 1
+            fi
+        else
+            # From August 2012 onwards: all months
+            return 0
+        fi
+    else
+        # After 2012: all months
+        return 0
+    fi
+}
+
 # Default configuration
 S3_BUCKET=${S3_BUCKET:-}
 AWS_REGION=${AWS_REGION:-us-east-2}
@@ -22,6 +73,24 @@ log "Starting Chess Rating Pipeline"
 log "Pipeline Mode: $PIPELINE_MODE"
 log "Process Month: $PROCESS_MONTH"
 log "S3 Bucket: $S3_BUCKET"
+
+# Parse year and month from PROCESS_MONTH
+YEAR=$(echo "$PROCESS_MONTH" | cut -d'-' -f1)
+MONTH=$(echo "$PROCESS_MONTH" | cut -d'-' -f2)
+
+# Remove leading zero from month for arithmetic operations
+MONTH_NUM=$((10#$MONTH))
+
+# Check if this is a valid FIDE rating period
+if is_valid_rating_period "$YEAR" "$MONTH_NUM"; then
+    log "Month $PROCESS_MONTH is a valid FIDE rating period"
+    VALID_FIDE_PERIOD=true
+else
+    log "Month $PROCESS_MONTH is NOT a valid FIDE rating period"
+    log "FIDE data processing steps (1-6) will be skipped"
+    log "Glicko rating calculation (step 7) will still run"
+    VALID_FIDE_PERIOD=false
+fi
 
 # Validate required environment variables
 if [ -z "$S3_BUCKET" ]; then
@@ -72,99 +141,111 @@ validate_post_scraping_data() {
 
 # Function to run full pipeline
 run_full_pipeline() {
-    log "Running full pipeline (all steps)..."
+    log "Running full pipeline..."
     
-    # Step 1: Download Player Data
-    log "Step 1: Downloading player data..."
-    python src/download_player_data.py \
-        --month "$PROCESS_MONTH" \
-        --s3_bucket "$S3_BUCKET" \
-        --aws_region "$AWS_REGION"
+    if [ "$VALID_FIDE_PERIOD" = true ]; then
+        log "Processing FIDE data steps (1-6) for valid rating period $PROCESS_MONTH"
+        
+        # Step 1: Download Player Data
+        log "Step 1: Downloading player data..."
+        python src/download_player_data.py \
+            --month "$PROCESS_MONTH" \
+            --s3_bucket "$S3_BUCKET" \
+            --aws_region "$AWS_REGION"
 
-    if [ $? -ne 0 ]; then
-        log "ERROR: Player data download failed"
-        exit 1
+        if [ $? -ne 0 ]; then
+            log "ERROR: Player data download failed"
+            exit 1
+        fi
+
+        log "Step 1 completed successfully"
+
+        # Step 2: Process Player Data
+        log "Step 2: Processing player data..."
+        python src/process_fide_rating_list.py \
+            --month "$PROCESS_MONTH" \
+            --s3_bucket "$S3_BUCKET" \
+            --aws_region "$AWS_REGION"
+
+        if [ $? -ne 0 ]; then
+            log "ERROR: Player data processing failed"
+            exit 1
+        fi
+
+        log "Step 2 completed successfully"
+
+        # Step 3: Scrape and Process Tournament Data (Combined)
+        log "Step 3: Scraping and processing tournament data..."
+        python src/tournament_scraper.py \
+            --month "$PROCESS_MONTH" \
+            --s3_bucket "$S3_BUCKET" \
+            --aws_region "$AWS_REGION"
+
+        if [ $? -ne 0 ]; then
+            log "ERROR: Tournament data scraping and processing failed"
+            exit 1
+        fi
+
+        log "Step 3 completed successfully"
+
+        # Step 4: Aggregate Player IDs
+        log "Step 4: Aggregating player IDs by time control..."
+        python src/aggregate_player_ids.py \
+            --month "$PROCESS_MONTH" \
+            --s3_bucket "$S3_BUCKET" \
+            --aws_region "$AWS_REGION"
+
+        if [ $? -ne 0 ]; then
+            log "ERROR: Player ID aggregation failed"
+            exit 1
+        fi
+
+        log "Step 4 completed successfully"
+
+        # Step 5: Scrape Player Calculations (Rust)
+        log "Step 5: Scraping player calculation data with Rust..."
+        calculation-scraper \
+            --month "$PROCESS_MONTH" \
+            --s3-bucket "$S3_BUCKET" \
+            --aws-region "$AWS_REGION"
+
+        if [ $? -ne 0 ]; then
+            log "ERROR: Player calculation scraping failed"
+            exit 1
+        fi
+
+        log "Step 5 completed successfully"
+        
+        # Continue to post-scraping steps
+        run_post_scraping_pipeline
+    else
+        log "Skipping FIDE data processing steps (1-6) for invalid rating period $PROCESS_MONTH"
+        log "Proceeding directly to Glicko rating calculation"
+        run_glicko_only_pipeline
     fi
-
-    log "Step 1 completed successfully"
-
-    # Step 2: Process Player Data
-    log "Step 2: Processing player data..."
-    python src/process_fide_rating_list.py \
-        --month "$PROCESS_MONTH" \
-        --s3_bucket "$S3_BUCKET" \
-        --aws_region "$AWS_REGION"
-
-    if [ $? -ne 0 ]; then
-        log "ERROR: Player data processing failed"
-        exit 1
-    fi
-
-    log "Step 2 completed successfully"
-
-    # Step 3: Scrape and Process Tournament Data (Combined)
-    log "Step 3: Scraping and processing tournament data..."
-    python src/tournament_scraper.py \
-        --month "$PROCESS_MONTH" \
-        --s3_bucket "$S3_BUCKET" \
-        --aws_region "$AWS_REGION"
-
-    if [ $? -ne 0 ]; then
-        log "ERROR: Tournament data scraping and processing failed"
-        exit 1
-    fi
-
-    log "Step 3 completed successfully"
-
-    # Step 4: Aggregate Player IDs
-    log "Step 4: Aggregating player IDs by time control..."
-    python src/aggregate_player_ids.py \
-        --month "$PROCESS_MONTH" \
-        --s3_bucket "$S3_BUCKET" \
-        --aws_region "$AWS_REGION"
-
-    if [ $? -ne 0 ]; then
-        log "ERROR: Player ID aggregation failed"
-        exit 1
-    fi
-
-    log "Step 4 completed successfully"
-
-    # Step 5: Scrape Player Calculations (Rust)
-    log "Step 5: Scraping player calculation data with Rust..."
-    calculation-scraper \
-        --month "$PROCESS_MONTH" \
-        --s3-bucket "$S3_BUCKET" \
-        --aws-region "$AWS_REGION"
-
-    if [ $? -ne 0 ]; then
-        log "ERROR: Player calculation scraping failed"
-        exit 1
-    fi
-
-    log "Step 5 completed successfully"
-    
-    # Continue to post-scraping steps
-    run_post_scraping_pipeline
 }
 
 # Function to run post-scraping pipeline
 run_post_scraping_pipeline() {
     log "Running post-scraping pipeline steps..."
     
-    # Step 6: Process Calculation Data (Rust)
-    log "Step 6: Processing calculation data with Rust..."
-    calculation-processor \
-        --month "$PROCESS_MONTH" \
-        --s3-bucket "$S3_BUCKET" \
-        --aws-region "$AWS_REGION"
+    if [ "$VALID_FIDE_PERIOD" = true ]; then
+        # Step 6: Process Calculation Data (Rust)
+        log "Step 6: Processing calculation data with Rust..."
+        calculation-processor \
+            --month "$PROCESS_MONTH" \
+            --s3-bucket "$S3_BUCKET" \
+            --aws-region "$AWS_REGION"
 
-    if [ $? -ne 0 ]; then
-        log "ERROR: Calculation data processing failed"
-        exit 1
+        if [ $? -ne 0 ]; then
+            log "ERROR: Calculation data processing failed"
+            exit 1
+        fi
+
+        log "Step 6 completed successfully"
+    else
+        log "Skipping calculation data processing (step 6) for invalid rating period $PROCESS_MONTH"
     fi
-
-    log "Step 6 completed successfully"
 
     run_glicko_only_pipeline
 }
@@ -175,6 +256,7 @@ run_glicko_only_pipeline() {
     
     # Step 7: Calculate Ratings
     log "Step 7: Calculating ratings with Glicko-2 algorithm..."
+    log "Note: Glicko runs for ALL months, regardless of FIDE rating period validity"
     
     # Add debugging
     log "Checking if run-glicko is available..."
@@ -247,12 +329,14 @@ upload_completion_marker() {
 Pipeline completed at $(date -u +%Y-%m-%dT%H:%M:%SZ) for month $PROCESS_MONTH
 Mode: $mode
 Status: $status
+Valid FIDE Rating Period: $VALID_FIDE_PERIOD
 
-Steps completed based on mode:
+Steps completed based on mode and rating period validity:
 EOF
 
         if [ "$mode" = "full" ]; then
-            cat >> /tmp/completion.txt << EOF
+            if [ "$VALID_FIDE_PERIOD" = true ]; then
+                cat >> /tmp/completion.txt << EOF
 1. Downloaded player data from FIDE
 2. Processed player data to JSON format
 3. Scraped tournament IDs and processed tournament data in parallel
@@ -262,14 +346,33 @@ EOF
 7. Calculated ratings using Glicko-2 algorithm (Rust)
 8. Uploaded results (placeholder)
 EOF
+            else
+                cat >> /tmp/completion.txt << EOF
+Steps 1-6: SKIPPED (invalid FIDE rating period)
+7. Calculated ratings using Glicko-2 algorithm (Rust)
+8. Uploaded results (placeholder)
+
+Note: FIDE data processing steps were skipped because $PROCESS_MONTH is not a valid FIDE rating period
+EOF
+            fi
         elif [ "$mode" = "post_scraping" ]; then
-            cat >> /tmp/completion.txt << EOF
+            if [ "$VALID_FIDE_PERIOD" = true ]; then
+                cat >> /tmp/completion.txt << EOF
 6. Processed calculation data into compact binary format (Rust)
 7. Calculated ratings using Glicko-2 algorithm (Rust)
 8. Uploaded results (placeholder)
 
 Note: Steps 1-5 were skipped (post-scraping mode)
 EOF
+            else
+                cat >> /tmp/completion.txt << EOF
+Step 6: SKIPPED (invalid FIDE rating period)
+7. Calculated ratings using Glicko-2 algorithm (Rust)
+8. Uploaded results (placeholder)
+
+Note: Steps 1-6 were skipped (post-scraping mode + invalid FIDE rating period)
+EOF
+            fi
         else
             cat >> /tmp/completion.txt << EOF
 7. Calculated ratings using Glicko-2 algorithm (Rust)
@@ -284,7 +387,7 @@ EOF
 Files created/modified:
 EOF
 
-        if [ "$mode" = "full" ]; then
+        if [ "$mode" = "full" ] && [ "$VALID_FIDE_PERIOD" = true ]; then
             cat >> /tmp/completion.txt << EOF
 - s3://$S3_BUCKET/persistent/player_info/raw/$PROCESS_MONTH.txt
 - s3://$S3_BUCKET/persistent/player_info/processed/$PROCESS_MONTH.txt
@@ -295,23 +398,34 @@ EOF
         fi
         
         cat >> /tmp/completion.txt << EOF
-- s3://$S3_BUCKET/persistent/calculations_processed/$PROCESS_MONTH/[time_control].bin.gz
-- s3://$S3_BUCKET/results/$PROCESS_MONTH/calculation_processing_completion.json
 - s3://$S3_BUCKET/persistent/ratings/$PROCESS_MONTH/[time_control].parquet
 - s3://$S3_BUCKET/persistent/top_ratings/$PROCESS_MONTH/[time_control]/[category].json
 - s3://$S3_BUCKET/results/$PROCESS_MONTH/rating_processing_completion.json
 
-Data structure:
-- Tournament data is organized by time control (standard/rapid/blitz)
-- Each tournament file contains JSON lines with player ID and name
-- Active player lists contain unique player IDs per time control for the month
-- Calculation files contain detailed game data and results for each player
-- Processed calculations are in compact binary format optimized for rating calculations
-- Player data is processed and ready for rating calculations
+Rating Data Structure:
 - Ratings are stored in Parquet format with rating, RD, and volatility values for each player
 - Top rating lists contain ranked lists by category (open, women, juniors, girls) with player details
 - All rating data uses Glicko-2 algorithm with proper uncertainty and volatility tracking
+- Glicko ratings are calculated for ALL months regardless of FIDE data availability
+
+FIDE Data Processing Logic:
+- FIDE rating periods vary by year:
+  * Before 2009: Quarterly (Jan, Apr, Jul, Oct)
+  * 2009 (Jan-Aug): Quarterly (Jan, Apr, Jul)
+  * 2009 (Sep-Dec): Bi-monthly (odd months: Sep, Nov)
+  * 2010-2011: Bi-monthly (odd months only)
+  * 2012 (Jan-Jul): Bi-monthly (odd months only)
+  * 2012 (Aug-Dec): Monthly
+  * 2013+: Monthly
 EOF
+
+        if [ "$VALID_FIDE_PERIOD" = false ]; then
+            cat >> /tmp/completion.txt << EOF
+
+Important: Month $PROCESS_MONTH is not a valid FIDE rating period.
+FIDE data processing was skipped, but Glicko rating calculation was performed using existing data.
+EOF
+        fi
         
         aws s3 cp /tmp/completion.txt "s3://$S3_BUCKET/results/$PROCESS_MONTH/completion_${mode}.txt"
         rm /tmp/completion.txt
@@ -324,18 +438,30 @@ case "$PIPELINE_MODE" in
         log "Starting full pipeline mode..."
         run_full_pipeline
         upload_completion_marker "full" "success"
-        log "Full Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
+        if [ "$VALID_FIDE_PERIOD" = true ]; then
+            log "Full Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
+        else
+            log "Chess Rating Pipeline completed successfully for $PROCESS_MONTH (FIDE steps skipped - invalid rating period)"
+        fi
         ;;
     "post_scraping")
         log "Starting post-scraping mode..."
-        validate_post_scraping_data
+        if [ "$VALID_FIDE_PERIOD" = true ]; then
+            validate_post_scraping_data
+        else
+            log "WARNING: Post-scraping mode with invalid FIDE period - validation skipped"
+        fi
         run_post_scraping_pipeline
         upload_completion_marker "post_scraping" "success"
-        log "Post-scraping Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
+        if [ "$VALID_FIDE_PERIOD" = true ]; then
+            log "Post-scraping Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
+        else
+            log "Post-scraping Chess Rating Pipeline completed successfully for $PROCESS_MONTH (FIDE steps skipped - invalid rating period)"
+        fi
         ;;
     "glicko_only")
         log "Starting Glicko-only pipeline mode..."
-        validate_post_scraping_data
+        log "Note: Glicko-only mode runs for ALL months regardless of FIDE rating period validity"
         run_glicko_only_pipeline
         upload_completion_marker "glicko_only" "success"
         log "Glicko-only Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
@@ -349,14 +475,18 @@ esac
 
 # Optional: Send notification (if SNS topic is configured)
 if [ -n "$SNS_TOPIC_ARN" ]; then
-    message="Chess Rating Pipeline ($PIPELINE_MODE mode) completed successfully for $PROCESS_MONTH."
-    
-    if [ "$PIPELINE_MODE" = "full" ]; then
-        message="$message Downloaded player data, processed it, scraped/processed tournament data in parallel, aggregated unique player IDs by time control, scraped individual player calculation data, processed calculations into binary format, and calculated ratings using Glicko-2 algorithm."
-    elif [ "$PIPELINE_MODE" = "post_scraping" ]; then
-        message="$message Processed calculation data into binary format and calculated ratings using Glicko-2 algorithm."
+    if [ "$VALID_FIDE_PERIOD" = true ]; then
+        message="Chess Rating Pipeline ($PIPELINE_MODE mode) completed successfully for $PROCESS_MONTH."
+        
+        if [ "$PIPELINE_MODE" = "full" ]; then
+            message="$message Downloaded player data, processed it, scraped/processed tournament data in parallel, aggregated unique player IDs by time control, scraped individual player calculation data, processed calculations into binary format, and calculated ratings using Glicko-2 algorithm."
+        elif [ "$PIPELINE_MODE" = "post_scraping" ]; then
+            message="$message Processed calculation data into binary format and calculated ratings using Glicko-2 algorithm."
+        else
+            message="$message Calculated ratings using Glicko-2 algorithm only."
+        fi
     else
-        message="$message Calculated ratings using Glicko-2 algorithm only."
+        message="Chess Rating Pipeline ($PIPELINE_MODE mode) completed successfully for $PROCESS_MONTH. Note: FIDE data processing steps were skipped because $PROCESS_MONTH is not a valid FIDE rating period. Only Glicko rating calculation was performed."
     fi
     
     aws sns publish \
