@@ -123,7 +123,7 @@ class PlayerDataDownloader:
                 extracted_file = os.path.join(self.local_temp_dir, f"{zip_header}frl.txt")
                 if os.path.exists(extracted_file):
                     os.rename(extracted_file, local_file)
-                extracted_file = os.path.join(self.local_temp_dir, f"{zip_header}FRL.TXT")
+                extracted_file = os.path.join(self.local_temp_dir, f"{zip_header.upper()}FRL.TXT")
                 if os.path.exists(extracted_file):
                     os.rename(extracted_file, local_file)
             
