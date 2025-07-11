@@ -1,15 +1,22 @@
 #!/bin/bash
-set -e
+set -eEux
+trap 'echo "Script failed at line $LINENO with exit code $?"; exit 1' ERR
+
+echo "==== SCRIPT START ===="
 
 # Function to log with timestamp
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
+echo "==== AFTER LOG FUNCTION DEFINITION ===="
+
 # Default configuration
 S3_BUCKET=${S3_BUCKET:-}
 AWS_REGION=${AWS_REGION:-us-east-2}
 PIPELINE_MODE=${PIPELINE_MODE:-full}
+
+echo "==== AFTER DEFAULT CONFIG ===="
 
 # Get process month from environment or calculate it
 if [ -z "$PROCESS_MONTH" ]; then
@@ -17,16 +24,27 @@ if [ -z "$PROCESS_MONTH" ]; then
     PROCESS_MONTH=$(date -d "$(date +'%Y-%m-01') -1 month" +'%Y-%m')
 fi
 
+echo "==== AFTER PROCESS_MONTH CALCULATION ===="
+
 log "Starting Chess Rating Pipeline"
 log "Pipeline Mode: $PIPELINE_MODE"
 log "Process Month: $PROCESS_MONTH"
 log "S3 Bucket: $S3_BUCKET"
+
+echo "==== AFTER INITIAL LOGGING ===="
 
 # Validate required environment variables
 if [ -z "$S3_BUCKET" ]; then
     log "ERROR: S3_BUCKET environment variable is required"
     exit 1
 fi
+
+echo "==== AFTER S3_BUCKET VALIDATION ===="
+
+# Dump all important env vars
+echo "==== ENVIRONMENT VARIABLES ===="
+env | grep -E 'S3_BUCKET|PROCESS_MONTH|PIPELINE_MODE|AWS' || echo "No matching env vars found"
+echo "==== END ENVIRONMENT VARIABLES ===="
 
 # Function to validate data exists for post-scraping mode
 validate_post_scraping_data() {
@@ -178,10 +196,13 @@ run_post_scraping_pipeline() {
 
 # Function to run glicko-only pipeline
 run_glicko_only_pipeline() {
+    echo "==== ENTERING run_glicko_only_pipeline FUNCTION ===="
     log "Running Glicko steps..."
     
     # Step 7: Calculate Ratings
     log "Step 7: Calculating ratings with Glicko-2 algorithm..."
+    
+    echo "==== BEFORE BINARY CHECKS ===="
     
     # Add debugging
     log "Checking if run-glicko is available..."
@@ -194,6 +215,8 @@ run_glicko_only_pipeline() {
     log "  --s3-bucket $S3_BUCKET"
     log "  --aws-region $AWS_REGION"
     
+    echo "==== BEFORE BINARY TEST ===="
+    
     # Test if binary can execute at all
     log "Testing binary execution..."
     if ! /app/bin/run-glicko --help >/dev/null 2>&1; then
@@ -202,6 +225,8 @@ run_glicko_only_pipeline() {
         file /app/bin/run-glicko || log "file failed"
         exit 1
     fi
+    
+    echo "==== AFTER BINARY TEST ===="
     
     log "Binary test passed, running with full parameters..."
     
@@ -215,9 +240,13 @@ run_glicko_only_pipeline() {
     log "  RUST_BACKTRACE=$RUST_BACKTRACE"
     log "  RUST_LOG_STYLE=$RUST_LOG_STYLE"
     
+    echo "==== BEFORE TEMP DIRECTORY CHECK ===="
+    
     # Check temp directory before and after
     log "Temp directory before execution:"
     ls -la /tmp/ | head -10
+    
+    echo "==== BEFORE run-glicko EXECUTION ===="
     
     # Monitor the run
     log "Running run-glicko and capturing ALL output..."
@@ -227,6 +256,8 @@ run_glicko_only_pipeline() {
     exec 3>&1 4>&2  # Save original stdout and stderr
     
     start_time=$(date +%s)
+    
+    echo "==== EXECUTING run-glicko COMMAND ===="
     
     run-glicko \
         --month "$PROCESS_MONTH" \
@@ -239,10 +270,14 @@ run_glicko_only_pipeline() {
     end_time=$(date +%s)
     runtime=$((end_time - start_time))
     
+    echo "==== AFTER run-glicko EXECUTION ===="
+    
     exec 3>&- 4>&-  # Close the saved descriptors
     set -e  # Re-enable exit on error
     
     log "run-glicko completed in ${runtime} seconds with exit code: $exit_code"
+    
+    echo "==== CHECKING OUTPUT FILES ===="
     
     # Check output files
     if [ -f /tmp/run-glicko-stdout.log ]; then
@@ -281,6 +316,8 @@ run_glicko_only_pipeline() {
 
     log "Step 7 completed successfully"
 
+    echo "==== BEFORE STEP 8 ===="
+
     # Step 8: Upload Results (Future implementation)
     log "Step 8: Uploading results..."
     log "⚠️  Results upload step not yet implemented"
@@ -297,6 +334,8 @@ run_glicko_only_pipeline() {
     #     --aws_region "$AWS_REGION"
     
     log "Step 8 placeholder completed"
+    
+    echo "==== EXITING run_glicko_only_pipeline FUNCTION ===="
 }
 
 # Function to upload completion marker
@@ -384,14 +423,19 @@ EOF
 }
 
 # Main execution logic
+echo "==== BEFORE CASE STATEMENT ===="
+echo "PIPELINE_MODE value: '$PIPELINE_MODE'"
+
 case "$PIPELINE_MODE" in
     "full")
+        echo "==== ENTERING FULL PIPELINE CASE ===="
         log "Starting full pipeline mode..."
         run_full_pipeline
         upload_completion_marker "full" "success"
         log "Full Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
         ;;
     "post_scraping")
+        echo "==== ENTERING POST_SCRAPING PIPELINE CASE ===="
         log "Starting post-scraping mode..."
         validate_post_scraping_data
         run_post_scraping_pipeline
@@ -399,18 +443,25 @@ case "$PIPELINE_MODE" in
         log "Post-scraping Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
         ;;
     "glicko_only")
+        echo "==== ENTERING GLICKO_ONLY PIPELINE CASE ===="
         log "Starting Glicko-only pipeline mode..."
+        echo "==== BEFORE VALIDATION ===="
         validate_post_scraping_data
+        echo "==== AFTER VALIDATION ===="
         run_glicko_only_pipeline
+        echo "==== AFTER run_glicko_only_pipeline ===="
         upload_completion_marker "glicko_only" "success"
         log "Glicko-only Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
         ;;
     *)
+        echo "==== ENTERING DEFAULT CASE ===="
         log "ERROR: Invalid PIPELINE_MODE: $PIPELINE_MODE"
         log "Valid modes: full, post_scraping, glicko_only"
         exit 1
         ;;
 esac
+
+echo "==== AFTER CASE STATEMENT ===="
 
 # Optional: Send notification (if SNS topic is configured)
 if [ -n "$SNS_TOPIC_ARN" ]; then
