@@ -355,25 +355,44 @@ impl CalculationProcessor {
         // Load tournament mappings from SQLite database
         let mappings = tokio::task::spawn_blocking({
             let local_db_path = local_db_path.clone();
+            let month_str = self.month_str.clone();
             move || -> Result<HashMap<String, String>> {
                 let conn = Connection::open(&local_db_path)
                     .context("Failed to open tournament database")?;
                 
-                let mut stmt = conn.prepare("SELECT tournament_id, target_month FROM tournament_players")
-                    .context("Failed to prepare tournament query")?;
-                
                 let mut mappings = HashMap::new();
-                let tournament_iter = stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?, // tournament_id
-                        row.get::<_, String>(1)?, // target_month
-                    ))
-                }).context("Failed to execute tournament query")?;
                 
-                for tournament_result in tournament_iter {
-                    let (tournament_id, target_month) = tournament_result
-                        .context("Failed to read tournament row")?;
-                    mappings.insert(tournament_id, target_month);
+                if self.is_multi_month {
+                    // Multi-month periods: tournament files have target_month field
+                    let mut stmt = conn.prepare("SELECT tournament_id, target_month FROM tournament_players")
+                        .context("Failed to prepare tournament query")?;
+                    
+                    let tournament_iter = stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?, // tournament_id
+                            row.get::<_, String>(1)?, // target_month
+                        ))
+                    }).context("Failed to execute tournament query")?;
+                    
+                    for tournament_result in tournament_iter {
+                        let (tournament_id, target_month) = tournament_result
+                            .context("Failed to read tournament row")?;
+                        mappings.insert(tournament_id, target_month);
+                    }
+                } else {
+                    // Single-month periods: all tournaments belong to the same month
+                    let mut stmt = conn.prepare("SELECT DISTINCT tournament_id FROM tournament_players")
+                        .context("Failed to prepare tournament query")?;
+                    
+                    let tournament_iter = stmt.query_map([], |row| {
+                        Ok(row.get::<_, String>(0)?) // tournament_id
+                    }).context("Failed to execute tournament query")?;
+                    
+                    for tournament_result in tournament_iter {
+                        let tournament_id = tournament_result
+                            .context("Failed to read tournament row")?;
+                        mappings.insert(tournament_id, month_str.clone());
+                    }
                 }
                 
                 info!("Loaded {} tournament mappings", mappings.len());
