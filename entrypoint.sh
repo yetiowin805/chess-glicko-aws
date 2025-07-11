@@ -182,6 +182,18 @@ run_glicko_only_pipeline() {
     
     # Step 7: Calculate Ratings
     log "Step 7: Calculating ratings with Glicko-2 algorithm..."
+    
+    # Add debugging
+    log "Checking if run-glicko is available..."
+    which run-glicko || log "run-glicko not found in PATH"
+    ls -la /app/bin/run-glicko || log "run-glicko binary not found at /app/bin/run-glicko"
+    
+    log "Current PATH: $PATH"
+    log "Running run-glicko with parameters:"
+    log "  --month $PROCESS_MONTH"
+    log "  --s3-bucket $S3_BUCKET"
+    log "  --aws-region $AWS_REGION"
+    
     run-glicko \
         --month "$PROCESS_MONTH" \
         --s3-bucket "$S3_BUCKET" \
