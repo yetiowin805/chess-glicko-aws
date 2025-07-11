@@ -4,6 +4,7 @@ use aws_sdk_s3::Client as S3Client;
 use aws_types::region::Region;
 use chrono::Utc;
 use clap::Parser;
+use futures::future;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{BufReader, Read};
@@ -135,6 +136,7 @@ struct ProcessingStats {
     time_control: String,
 }
 
+#[derive(Clone)]
 struct RatingProcessor {
     s3_client: S3Client,
     s3_bucket: String,
@@ -209,33 +211,41 @@ impl RatingProcessor {
         info!("🎯 Processing time controls: {:?}", time_controls);
         info!("📈 Processing {} time control(s) in parallel", time_controls.len());
         
-        // Process time controls in parallel
-        let results: Vec<Result<ProcessingStats>> = time_controls
-            .into_par_iter()
+        // Process time controls in parallel using Tokio tasks instead of Rayon
+        let tasks: Vec<_> = time_controls
+            .into_iter()
             .map(|time_control| {
-                info!("🔄 Starting parallel processing for time control: {}", time_control);
-                let result = tokio::runtime::Handle::current().block_on(
-                    self.process_time_control(time_control)
-                );
-                match &result {
-                    Ok(stats) => info!("✅ Completed time control {}: {:?}", time_control, stats),
-                    Err(e) => error!("❌ Failed time control {}: {}", time_control, e),
-                }
-                result
+                let processor = self.clone();
+                tokio::task::spawn(async move {
+                    info!("🔄 Starting parallel processing for time control: {}", time_control);
+                    let result = processor.process_time_control(&time_control).await;
+                    match &result {
+                        Ok(stats) => info!("✅ Completed time control {}: {:?}", time_control, stats),
+                        Err(e) => error!("❌ Failed time control {}: {}", time_control, e),
+                    }
+                    result
+                })
             })
             .collect();
+        
+        // Wait for all tasks to complete
+        let results = future::join_all(tasks).await;
         
         let mut processing_results = Vec::new();
         let mut has_errors = false;
         
-        for result in results {
-            match result {
-                Ok(stats) => {
+        for task_result in results {
+            match task_result {
+                Ok(Ok(stats)) => {
                     info!("✅ Successfully processed {}: {:?}", stats.time_control, stats);
                     processing_results.push((stats.time_control.clone(), serde_json::to_value(stats)?));
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!("❌ Error processing time control: {}", e);
+                    has_errors = true;
+                }
+                Err(e) => {
+                    error!("❌ Task panicked: {}", e);
                     has_errors = true;
                 }
             }
