@@ -2,21 +2,15 @@
 set -eEux
 trap 'echo "Script failed at line $LINENO with exit code $?"; exit 1' ERR
 
-echo "==== SCRIPT START ===="
-
 # Function to log with timestamp
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
-echo "==== AFTER LOG FUNCTION DEFINITION ===="
-
 # Default configuration
 S3_BUCKET=${S3_BUCKET:-}
 AWS_REGION=${AWS_REGION:-us-east-2}
 PIPELINE_MODE=${PIPELINE_MODE:-full}
-
-echo "==== AFTER DEFAULT CONFIG ===="
 
 # Get process month from environment or calculate it
 if [ -z "$PROCESS_MONTH" ]; then
@@ -24,27 +18,16 @@ if [ -z "$PROCESS_MONTH" ]; then
     PROCESS_MONTH=$(date -d "$(date +'%Y-%m-01') -1 month" +'%Y-%m')
 fi
 
-echo "==== AFTER PROCESS_MONTH CALCULATION ===="
-
 log "Starting Chess Rating Pipeline"
 log "Pipeline Mode: $PIPELINE_MODE"
 log "Process Month: $PROCESS_MONTH"
 log "S3 Bucket: $S3_BUCKET"
-
-echo "==== AFTER INITIAL LOGGING ===="
 
 # Validate required environment variables
 if [ -z "$S3_BUCKET" ]; then
     log "ERROR: S3_BUCKET environment variable is required"
     exit 1
 fi
-
-echo "==== AFTER S3_BUCKET VALIDATION ===="
-
-# Dump all important env vars
-echo "==== ENVIRONMENT VARIABLES ===="
-env | grep -E 'S3_BUCKET|PROCESS_MONTH|PIPELINE_MODE|AWS' || echo "No matching env vars found"
-echo "==== END ENVIRONMENT VARIABLES ===="
 
 # Function to validate data exists for post-scraping mode
 validate_post_scraping_data() {
@@ -71,8 +54,7 @@ validate_post_scraping_data() {
     # Check if processed calculation data already exists (to avoid reprocessing)
     local processed_calc_count=$(aws s3 ls "s3://$S3_BUCKET/persistent/calculations_processed/" --recursive | grep "$PROCESS_MONTH" | wc -l)
     if [ "$processed_calc_count" -gt 0 ]; then
-        log "⚠️  Processed calculation data already exists for $PROCESS_MONTH"
-        log "Found $processed_calc_count processed calculation files"
+        log "Processed calculation data already exists for $PROCESS_MONTH ($processed_calc_count files)"
         log "The calculation processor will skip processing if data already exists"
     fi
     
@@ -80,17 +62,10 @@ validate_post_scraping_data() {
         log "ERROR: Required data is missing for post-scraping mode:"
         echo -e "$missing_data"
         log ""
-        log "The post-scraping mode requires that the following pipeline steps have been completed:"
-        log "1. Download player data"
-        log "2. Process player data"
-        log "3. Scrape and process tournament data"
-        log "4. Aggregate player IDs"
-        log "5. Scrape player calculations"
-        log ""
         log "Please run the full pipeline first, or use PIPELINE_MODE=full to run all steps."
         exit 1
     else
-        log "✅ All required data found for post-scraping mode"
+        log "All required data found for post-scraping mode"
         log "Found calculation files: $calc_count"
     fi
 }
@@ -196,26 +171,15 @@ run_post_scraping_pipeline() {
 
 # Function to run glicko-only pipeline
 run_glicko_only_pipeline() {
-    echo "==== ENTERING run_glicko_only_pipeline FUNCTION ===="
     log "Running Glicko steps..."
     
     # Step 7: Calculate Ratings
     log "Step 7: Calculating ratings with Glicko-2 algorithm..."
     
-    echo "==== BEFORE BINARY CHECKS ===="
-    
     # Add debugging
     log "Checking if run-glicko is available..."
     which run-glicko || log "run-glicko not found in PATH"
     ls -la /app/bin/run-glicko || log "run-glicko binary not found at /app/bin/run-glicko"
-    
-    log "Current PATH: $PATH"
-    log "Running run-glicko with parameters:"
-    log "  --month $PROCESS_MONTH"
-    log "  --s3-bucket $S3_BUCKET"
-    log "  --aws-region $AWS_REGION"
-    
-    echo "==== BEFORE BINARY TEST ===="
     
     # Test if binary can execute at all
     log "Testing binary execution..."
@@ -226,88 +190,29 @@ run_glicko_only_pipeline() {
         exit 1
     fi
     
-    echo "==== AFTER BINARY TEST ===="
-    
     log "Binary test passed, running with full parameters..."
     
-    # Set Rust logging levels and force output
-    export RUST_LOG=trace
-    export RUST_BACKTRACE=full
-    export RUST_LOG_STYLE=always
-    
-    log "Environment variables set:"
-    log "  RUST_LOG=$RUST_LOG"
-    log "  RUST_BACKTRACE=$RUST_BACKTRACE"
-    log "  RUST_LOG_STYLE=$RUST_LOG_STYLE"
-    
-    echo "==== BEFORE TEMP DIRECTORY CHECK ===="
-    
-    # Check temp directory before and after
-    log "Temp directory before execution:"
-    ls -la /tmp/ | head -10
-    
-    echo "==== BEFORE run-glicko EXECUTION ===="
+    # Set Rust logging levels
+    export RUST_LOG=info
+    export RUST_BACKTRACE=1
     
     # Monitor the run
-    log "Running run-glicko and capturing ALL output..."
     set +e  # Don't exit on error
     
-    # Redirect both stdout and stderr explicitly
-    exec 3>&1 4>&2  # Save original stdout and stderr
-    
     start_time=$(date +%s)
-    
-    echo "==== EXECUTING run-glicko COMMAND ===="
     
     run-glicko \
         --month "$PROCESS_MONTH" \
         --s3-bucket "$S3_BUCKET" \
-        --aws-region "$AWS_REGION" \
-        1> >(tee /tmp/run-glicko-stdout.log >&3) \
-        2> >(tee /tmp/run-glicko-stderr.log >&4)
+        --aws-region "$AWS_REGION"
     
     exit_code=$?
     end_time=$(date +%s)
     runtime=$((end_time - start_time))
     
-    echo "==== AFTER run-glicko EXECUTION ===="
-    
-    exec 3>&- 4>&-  # Close the saved descriptors
     set -e  # Re-enable exit on error
     
     log "run-glicko completed in ${runtime} seconds with exit code: $exit_code"
-    
-    echo "==== CHECKING OUTPUT FILES ===="
-    
-    # Check output files
-    if [ -f /tmp/run-glicko-stdout.log ]; then
-        stdout_size=$(wc -c < /tmp/run-glicko-stdout.log)
-        log "STDOUT size: $stdout_size bytes"
-        if [ $stdout_size -gt 0 ]; then
-            log "STDOUT content:"
-            cat /tmp/run-glicko-stdout.log
-        fi
-    fi
-    
-    if [ -f /tmp/run-glicko-stderr.log ]; then
-        stderr_size=$(wc -c < /tmp/run-glicko-stderr.log)
-        log "STDERR size: $stderr_size bytes"
-        if [ $stderr_size -gt 0 ]; then
-            log "STDERR content:"
-            cat /tmp/run-glicko-stderr.log
-        fi
-    fi
-    
-    # Check temp directory after
-    log "Temp directory after execution:"
-    ls -la /tmp/ | head -10
-    
-    # Check if any new files were created
-    log "New files in temp (if any):"
-    find /tmp -newer /tmp/run-glicko-stdout.log 2>/dev/null || log "No new files found"
-    
-    # Cleanup
-    rm -f /tmp/run-glicko-stdout.log /tmp/run-glicko-stderr.log
 
     if [ $exit_code -ne 0 ]; then
         log "ERROR: Rating calculation failed with exit code $exit_code"
@@ -316,16 +221,9 @@ run_glicko_only_pipeline() {
 
     log "Step 7 completed successfully"
 
-    echo "==== BEFORE STEP 8 ===="
-
     # Step 8: Upload Results (Future implementation)
     log "Step 8: Uploading results..."
-    log "⚠️  Results upload step not yet implemented"
-    log "This step will:"
-    log "- Upload calculated ratings"
-    log "- Generate summary reports"
-    log "- Create performance metrics"
-    log "- Send notifications"
+    log "Results upload step not yet implemented"
     
     # Placeholder for results upload
     # python src/upload_results.py \
@@ -334,8 +232,6 @@ run_glicko_only_pipeline() {
     #     --aws_region "$AWS_REGION"
     
     log "Step 8 placeholder completed"
-    
-    echo "==== EXITING run_glicko_only_pipeline FUNCTION ===="
 }
 
 # Function to upload completion marker
@@ -423,19 +319,14 @@ EOF
 }
 
 # Main execution logic
-echo "==== BEFORE CASE STATEMENT ===="
-echo "PIPELINE_MODE value: '$PIPELINE_MODE'"
-
 case "$PIPELINE_MODE" in
     "full")
-        echo "==== ENTERING FULL PIPELINE CASE ===="
         log "Starting full pipeline mode..."
         run_full_pipeline
         upload_completion_marker "full" "success"
         log "Full Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
         ;;
     "post_scraping")
-        echo "==== ENTERING POST_SCRAPING PIPELINE CASE ===="
         log "Starting post-scraping mode..."
         validate_post_scraping_data
         run_post_scraping_pipeline
@@ -443,25 +334,18 @@ case "$PIPELINE_MODE" in
         log "Post-scraping Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
         ;;
     "glicko_only")
-        echo "==== ENTERING GLICKO_ONLY PIPELINE CASE ===="
         log "Starting Glicko-only pipeline mode..."
-        echo "==== BEFORE VALIDATION ===="
         validate_post_scraping_data
-        echo "==== AFTER VALIDATION ===="
         run_glicko_only_pipeline
-        echo "==== AFTER run_glicko_only_pipeline ===="
         upload_completion_marker "glicko_only" "success"
         log "Glicko-only Chess Rating Pipeline completed successfully for $PROCESS_MONTH"
         ;;
     *)
-        echo "==== ENTERING DEFAULT CASE ===="
         log "ERROR: Invalid PIPELINE_MODE: $PIPELINE_MODE"
         log "Valid modes: full, post_scraping, glicko_only"
         exit 1
         ;;
 esac
-
-echo "==== AFTER CASE STATEMENT ===="
 
 # Optional: Send notification (if SNS topic is configured)
 if [ -n "$SNS_TOPIC_ARN" ]; then

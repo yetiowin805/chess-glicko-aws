@@ -11,7 +11,7 @@ use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::Connection;
@@ -149,43 +149,29 @@ struct RatingProcessor {
 
 impl RatingProcessor {
     async fn new(s3_bucket: String, aws_region: String, month_str: String, workers: usize) -> Result<Self> {
-        info!("🚀 Initializing RatingProcessor...");
-        info!("  - S3 Bucket: {}", s3_bucket);
-        info!("  - AWS Region: {}", aws_region);
-        info!("  - Month: {}", month_str);
-        info!("  - Workers: {}", workers);
+        info!("Initializing processor for {} with {} workers", month_str, workers);
 
-        debug!("Loading AWS configuration...");
         let config = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(aws_region.clone()))
             .load()
             .await;
         
-        debug!("Creating S3 client...");
         let s3_client = S3Client::new(&config);
         
         let temp_dir = PathBuf::from("/tmp/rating_data");
-        info!("Creating temp directory: {}", temp_dir.display());
-        
         fs::create_dir_all(&temp_dir).await
             .context("Failed to create temp directory")?;
         
-        debug!("Parsing month string: {}", month_str);
         let year: i32 = month_str[0..4].parse()
             .context("Invalid month format")?;
         let month: u32 = month_str[5..7].parse()
             .context("Invalid month format")?;
         
-        info!("Parsed date: Year={}, Month={}", year, month);
-        
         // Set up Rayon thread pool
-        info!("Initializing Rayon thread pool with {} workers...", workers);
         rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
             .build_global()
             .context("Failed to initialize thread pool")?;
-        
-        info!("✅ RatingProcessor initialized successfully");
         
         Ok(Self {
             s3_client,
@@ -199,7 +185,7 @@ impl RatingProcessor {
     }
 
     async fn process_ratings_for_month(&self) -> Result<()> {
-        info!("📊 Starting rating processing for {}", self.month_str);
+        info!("Starting rating processing for {}", self.month_str);
         
         // Determine time controls to process based on year
         let time_controls = if self.year > 2012 || (self.year == 2012 && self.month >= 2) {
@@ -208,22 +194,15 @@ impl RatingProcessor {
             vec!["standard"]
         };
         
-        info!("🎯 Processing time controls: {:?}", time_controls);
-        info!("📈 Processing {} time control(s) in parallel", time_controls.len());
+        info!("Processing {} time control(s): {:?}", time_controls.len(), time_controls);
         
-        // Process time controls in parallel using Tokio tasks instead of Rayon
+        // Process time controls in parallel using Tokio tasks
         let tasks: Vec<_> = time_controls
             .into_iter()
             .map(|time_control| {
                 let processor = self.clone();
                 tokio::task::spawn(async move {
-                    info!("🔄 Starting parallel processing for time control: {}", time_control);
-                    let result = processor.process_time_control(&time_control).await;
-                    match &result {
-                        Ok(stats) => info!("✅ Completed time control {}: {:?}", time_control, stats),
-                        Err(e) => error!("❌ Failed time control {}: {}", time_control, e),
-                    }
-                    result
+                    processor.process_time_control(&time_control).await
                 })
             })
             .collect();
@@ -237,118 +216,95 @@ impl RatingProcessor {
         for task_result in results {
             match task_result {
                 Ok(Ok(stats)) => {
-                    info!("✅ Successfully processed {}: {:?}", stats.time_control, stats);
+                    info!("Completed {}: {} players, {} games", stats.time_control, stats.total_players, stats.total_games);
                     processing_results.push((stats.time_control.clone(), serde_json::to_value(stats)?));
                 }
                 Ok(Err(e)) => {
-                    error!("❌ Error processing time control: {}", e);
+                    error!("Failed time control: {}", e);
                     has_errors = true;
                 }
                 Err(e) => {
-                    error!("❌ Task panicked: {}", e);
+                    error!("Task panicked: {}", e);
                     has_errors = true;
                 }
             }
         }
         
         if has_errors {
-            error!("❌ Some time controls failed to process");
             return Err(anyhow::anyhow!("Processing failed for some time controls"));
         }
         
-        info!("📝 Uploading processing completion marker...");
         self.upload_processing_completion_marker(&processing_results).await?;
-        info!("🎉 Rating processing completed successfully for {}", self.month_str);
+        info!("Rating processing completed successfully for {}", self.month_str);
         
         Ok(())
     }
 
     async fn process_time_control(&self, time_control: &str) -> Result<ProcessingStats> {
-        info!("🔍 Processing time control: {}", time_control);
+        info!("Processing time control: {}", time_control);
         
         // Check if already processed
         let parquet_s3_key = format!("persistent/ratings/{}/{}.parquet", self.month_str, time_control);
-        info!("🔎 Checking if already processed: {}", parquet_s3_key);
         
         if self.check_s3_file_exists(&parquet_s3_key).await? {
-            warn!("⚠️  Ratings already processed for {}: {}", time_control, parquet_s3_key);
-            info!("📋 Returning empty stats for already processed time control");
+            warn!("Already processed: {}", parquet_s3_key);
             return Ok(ProcessingStats {
                 time_control: time_control.to_string(),
                 ..Default::default()
             });
         }
         
-        info!("✨ Starting fresh processing for {}", time_control);
-        
         // Load current ratings from previous month
-        info!("📖 Loading current ratings from previous month...");
         let mut players = self.load_current_ratings(time_control).await?;
-        info!("✅ Loaded {} players with existing ratings", players.len());
+        info!("Loaded {} existing player ratings", players.len());
         
         // Load and process games for this month
-        info!("🎮 Loading games from binary data...");
         let total_games_loaded = self.load_games_from_binary(time_control, &mut players).await?;
-        info!("✅ Loaded {} games for {} {}", total_games_loaded, time_control, self.month_str);
+        info!("Loaded {} games for {}", total_games_loaded, time_control);
         
         if total_games_loaded == 0 {
-            warn!("⚠️  No games found for {}, applying RD decay only", time_control);
+            warn!("No games found for {}, applying RD decay only", time_control);
         }
         
         // Update ratings in parallel
-        info!("⚡ Updating ratings in parallel...");
         let stats = self.update_ratings_parallel(&mut players, time_control).await?;
-        info!("✅ Rating updates completed");
         
         // Load player info for output
-        info!("👥 Loading player information...");
         let player_info = self.load_player_info(time_control).await?;
-        info!("✅ Loaded {} player info records", player_info.len());
         
         // Save updated ratings as Parquet
-        info!("💾 Saving ratings as Parquet...");
         self.save_ratings_parquet(&players, time_control).await?;
-        info!("✅ Ratings saved to Parquet");
         
         // Generate and save top rating lists as JSON
-        info!("🏆 Generating top rating lists...");
         self.generate_top_rating_lists(&players, &player_info, time_control).await?;
-        info!("✅ Top rating lists generated");
         
-        info!("🎯 Time control {} processing completed successfully", time_control);
+        info!("Completed {}: {} players processed", time_control, stats.total_players);
         Ok(stats)
     }
 
     async fn load_current_ratings(&self, time_control: &str) -> Result<HashMap<String, Player>> {
-        info!("📚 Loading current ratings for time control: {}", time_control);
-        
         // Try to load previous month's ratings
         let prev_month = self.calculate_previous_month(&self.month_str)?;
         let prev_ratings_key = format!("persistent/ratings/{}/{}.parquet", prev_month, time_control);
         
-        info!("🔍 Looking for previous month ratings: {}", prev_ratings_key);
-        
         if self.check_s3_file_exists(&prev_ratings_key).await? {
-            info!("✅ Found previous month ratings: {}", prev_month);
+            info!("Loading previous ratings from {}", prev_month);
             return self.load_ratings_from_parquet(&prev_ratings_key).await;
         }
         
         // If no previous ratings, start with empty set
-        warn!("⚠️  No previous ratings found, starting fresh for {}", time_control);
+        warn!("No previous ratings found, starting fresh for {}", time_control);
         Ok(HashMap::new())
     }
 
     async fn load_ratings_from_parquet(&self, s3_key: &str) -> Result<HashMap<String, Player>> {
-        info!("📥 Downloading Parquet file from S3: {}", s3_key);
         let local_file = self.temp_dir.join("previous_ratings.parquet");
         
         self.download_file(s3_key, &local_file).await
             .context("Failed to download previous ratings file")?;
-        info!("✅ Downloaded Parquet file to: {}", local_file.display());
         
         let mut players = HashMap::new();
         
-        info!("📖 Reading Parquet file...");
         // Read Parquet file using Arrow
         let file = std::fs::File::open(&local_file)
             .context("Failed to open local Parquet file")?;
@@ -357,15 +313,11 @@ impl RatingProcessor {
         let reader = builder.build()
             .context("Failed to build Parquet reader")?;
         
-        let mut batch_count = 0;
         let mut total_rows = 0;
         
         for batch_result in reader {
             let batch = batch_result.context("Failed to read batch from Parquet file")?;
-            batch_count += 1;
             total_rows += batch.num_rows();
-            
-            debug!("Processing batch {} with {} rows", batch_count, batch.num_rows());
             
             let player_ids = batch.column(0).as_any().downcast_ref::<StringArray>()
                 .context("Failed to read player_id column")?;
@@ -395,72 +347,55 @@ impl RatingProcessor {
             }
         }
         
-        info!("✅ Processed {} batches with {} total rows", batch_count, total_rows);
-        
         fs::remove_file(&local_file).await
             .context("Failed to remove temporary Parquet file")?;
-        info!("✅ Loaded {} players from previous Parquet file", players.len());
         Ok(players)
     }
 
     async fn load_games_from_binary(&self, time_control: &str, players: &mut HashMap<String, Player>) -> Result<u64> {
         let binary_s3_key = format!("persistent/calculations_processed/{}_{}.bin.gz", self.month_str, time_control);
-        info!("🔍 Looking for binary games file: {}", binary_s3_key);
         
         if !self.check_s3_file_exists(&binary_s3_key).await? {
-            warn!("⚠️  No games file found for {}: {}", time_control, binary_s3_key);
+            warn!("No games file found: {}", binary_s3_key);
             return Ok(0);
         }
-        
-        info!("✅ Found binary games file, proceeding with download");
         
         let compressed_file = self.temp_dir.join(format!("{}_{}.bin.gz", self.month_str, time_control));
         let binary_file = self.temp_dir.join(format!("{}_{}.bin", self.month_str, time_control));
         
         // Download and decompress
-        info!("📥 Downloading compressed binary file...");
         self.download_file(&binary_s3_key, &compressed_file).await
             .context("Failed to download binary games file")?;
-        info!("✅ Downloaded to: {}", compressed_file.display());
         
-        info!("🗜️  Decompressing binary file...");
         self.decompress_file(&compressed_file, &binary_file).await
             .context("Failed to decompress binary file")?;
-        info!("✅ Decompressed to: {}", binary_file.display());
         
         // Read binary file
-        info!("📖 Reading binary games file...");
         let games_loaded = self.read_binary_games_file(&binary_file, players).await
             .context("Failed to read binary games file")?;
         
         // Cleanup
-        info!("🧹 Cleaning up temporary files...");
         fs::remove_file(&compressed_file).await
             .context("Failed to remove compressed file")?;
         fs::remove_file(&binary_file).await
             .context("Failed to remove binary file")?;
-        info!("✅ Cleanup completed");
         
         Ok(games_loaded)
     }
 
     async fn read_binary_games_file(&self, file_path: &PathBuf, players: &mut HashMap<String, Player>) -> Result<u64> {
-        info!("📖 Opening binary file: {}", file_path.display());
         let file = std::fs::File::open(file_path)
             .context("Failed to open binary games file")?;
         let mut reader = BufReader::new(file);
         
         // Read file header
-        debug!("📋 Reading file header...");
         let mut header_bytes = [0u8; std::mem::size_of::<FileHeader>()];
         reader.read_exact(&mut header_bytes)
             .context("Failed to read file header")?;
         let header: FileHeader = unsafe { std::ptr::read(header_bytes.as_ptr() as *const FileHeader) };
         
         // Verify magic header and version
-        info!("🔍 Verifying file format...");
         if header.magic != *MAGIC_HEADER {
-            error!("❌ Invalid magic header in binary file");
             anyhow::bail!("Invalid magic header in binary file");
         }
         
@@ -468,31 +403,17 @@ impl RatingProcessor {
         let version = header.version;
         let player_count = header.player_count;
         let total_games = header.total_games;
-        let time_control = header.time_control;
-        let timestamp = header.timestamp;
         
         if version != FORMAT_VERSION {
-            error!("❌ Unsupported file version: {}", version);
             anyhow::bail!("Unsupported file version: {}", version);
         }
         
-        info!("✅ File format verified successfully");
-        info!("📊 File contains:");
-        info!("  - Players: {}", player_count);
-        info!("  - Total games: {}", total_games);
-        info!("  - Time control: {}", time_control);
-        info!("  - Timestamp: {}", timestamp);
+        info!("Processing {} players with {} total games", player_count, total_games);
         
         let mut total_games_loaded = 0u64;
-        let mut processed_players = 0u32;
         
         // Read player data
-        info!("👥 Processing player data...");
         for player_idx in 0..player_count {
-            if player_idx % 1000 == 0 {
-                debug!("Processing player {}/{}", player_idx, player_count);
-            }
-            
             // Read player header
             let mut player_header_bytes = [0u8; std::mem::size_of::<PlayerHeader>()];
             reader.read_exact(&mut player_header_bytes)
@@ -521,7 +442,7 @@ impl RatingProcessor {
             });
             
             // Read games for this player
-            for game_idx in 0..player_header.game_count {
+            for _game_idx in 0..player_header.game_count {
                 let mut game_bytes = [0u8; std::mem::size_of::<GameRecord>()];
                 reader.read_exact(&mut game_bytes)
                     .context("Failed to read game record")?;
@@ -534,10 +455,7 @@ impl RatingProcessor {
                     0 => 0.0, // Loss
                     1 => 0.5, // Draw
                     2 => 1.0, // Win
-                    _ => {
-                        debug!("Invalid game result for player {} game {}", player_id, game_idx);
-                        continue; // Invalid result
-                    }
+                    _ => continue, // Invalid result
                 };
                 
                 // Use opponent rating if available, otherwise use default
@@ -556,14 +474,7 @@ impl RatingProcessor {
                 player.games.push(game_result);
                 total_games_loaded += 1;
             }
-            
-            processed_players += 1;
         }
-        
-        info!("✅ Binary file processing completed:");
-        info!("  - Processed players: {}", processed_players);
-        info!("  - Total games loaded: {}", total_games_loaded);
-        info!("  - Unique players in map: {}", players.len());
         
         Ok(total_games_loaded)
     }
@@ -573,12 +484,10 @@ impl RatingProcessor {
         let processed_count = Arc::new(AtomicU64::new(0));
         let total_games = Arc::new(AtomicU64::new(0));
         
-        info!("⚡ Starting parallel rating updates for {} players", total_players);
+        info!("Updating ratings for {} players using {} threads", total_players, self.workers);
         
         // Convert to vector for parallel processing
         let mut player_vec: Vec<_> = players.drain().collect();
-        
-        info!("🔄 Processing players in parallel using {} threads", self.workers);
         
         // Process players in parallel
         player_vec.par_iter_mut().for_each(|(_, player)| {
@@ -588,18 +497,15 @@ impl RatingProcessor {
             self.update_player_rating(player);
             
             let processed = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if processed % 1000 == 0 {
-                info!("📈 Processed {}/{} players", processed, total_players);
+            if processed % 5000 == 0 {
+                info!("Processed {}/{} players", processed, total_players);
             }
         });
-        
-        info!("✅ Parallel processing completed, reassembling data...");
         
         // Put players back into HashMap
         *players = player_vec.into_iter().collect();
         
         // Apply new ratings
-        info!("🔄 Applying new ratings...");
         for player in players.values_mut() {
             player.rating = player.new_rating;
             player.rd = player.new_rd;
@@ -608,9 +514,6 @@ impl RatingProcessor {
         }
         
         let final_total_games = total_games.load(Ordering::Relaxed);
-        info!("✅ Rating updates completed:");
-        info!("  - Total players: {}", total_players);
-        info!("  - Total games processed: {}", final_total_games);
         
         Ok(ProcessingStats {
             total_players,
@@ -674,8 +577,6 @@ impl RatingProcessor {
     }
 
     async fn load_player_info(&self, time_control: &str) -> Result<HashMap<String, PlayerInfo>> {
-        info!("👥 Loading player information for time control: {}", time_control);
-        
         // Determine which player database to use based on period logic
         let database_month = self.get_player_database_month(&self.month_str)?;
         
@@ -687,34 +588,26 @@ impl RatingProcessor {
             time_control
         };
         
-        info!("📅 Database month: {}", database_month);
-        info!("🎯 Database time control: {}", database_time_control);
-        
         let db_s3_key = format!("persistent/player_info/processed/{}/{}.db", 
                                database_time_control, database_month);
         let local_db = self.temp_dir.join(format!("player_info_{}_{}.db", database_month, time_control));
         
-        info!("🔍 Looking for player info database: {}", db_s3_key);
-        
         if !self.check_s3_file_exists(&db_s3_key).await? {
-            warn!("⚠️  No player info database found for {} (using {})", time_control, database_month);
+            warn!("No player info database found for {}", time_control);
             return Ok(HashMap::new());
         }
         
-        info!("📥 Downloading player info database...");
         self.download_file(&db_s3_key, &local_db).await
             .context("Failed to download player info database")?;
-        info!("✅ Downloaded to: {}", local_db.display());
         
         // Load player info from SQLite
-        info!("📖 Reading player info from SQLite database...");
         let player_info = tokio::task::spawn_blocking({
             let local_db = local_db.clone();
             move || -> Result<HashMap<String, PlayerInfo>> {
                 let conn = Connection::open(&local_db)
                     .context("Failed to open player info database")?;
                 
-                let mut stmt = conn.prepare("SELECT id, name, federation, sex, birth_year FROM players")
+                let mut stmt = conn.prepare("SELECT id, name, fed, sex, b_year FROM players")
                     .context("Failed to prepare player info query")?;
                 
                 let mut player_info = HashMap::new();
@@ -728,26 +621,19 @@ impl RatingProcessor {
                     })
                 }).context("Failed to execute player info query")?;
                 
-                let mut count = 0;
                 for player_result in player_iter {
                     let player = player_result.context("Failed to read player info row")?;
                     player_info.insert(player.id.clone(), player);
-                    count += 1;
-                    
-                    if count % 10000 == 0 {
-                        debug!("Loaded {} player info records", count);
-                    }
                 }
                 
-                info!("✅ Loaded {} player info records", player_info.len());
                 Ok(player_info)
             }
         }).await??;
         
-        info!("🧹 Removing temporary database file...");
         fs::remove_file(&local_db).await
             .context("Failed to remove temporary database file")?;
         
+        info!("Loaded {} player info records", player_info.len());
         Ok(player_info)
     }
 
@@ -755,10 +641,6 @@ impl RatingProcessor {
         let year: i32 = month_str[0..4].parse()?;
         let month: u32 = month_str[5..7].parse()?;
         
-        debug!("Calculating player database month for {}-{:02}", year, month);
-        
-        // Player database selection: earlier months in a period use the previous period's 
-        // final database, while the last month of a period uses its own database
         let result = if year < 2009 || (year == 2009 && month < 9) {
             // 3-month periods
             match month {
@@ -784,17 +666,15 @@ impl RatingProcessor {
             month_str.to_string()
         };
         
-        debug!("Selected database month: {}", result);
         Ok(result)
     }
 
     async fn save_ratings_parquet(&self, players: &HashMap<String, Player>, time_control: &str) -> Result<()> {
-        info!("💾 Saving {} player ratings as Parquet for {}", players.len(), time_control);
+        info!("Saving {} player ratings to Parquet", players.len());
         
         let local_file = self.temp_dir.join(format!("{}_{}.parquet", self.month_str, time_control));
         
         // Prepare data for Parquet
-        info!("📊 Preparing data for Parquet format...");
         let mut player_ids = Vec::new();
         let mut ratings = Vec::new();
         let mut rds = Vec::new();
@@ -807,7 +687,6 @@ impl RatingProcessor {
             volatilities.push(player.volatility);
         }
         
-        info!("📋 Creating Arrow schema...");
         // Create Arrow schema
         let schema = Arc::new(Schema::new(vec![
             Field::new("player_id", DataType::Utf8, false),
@@ -816,7 +695,6 @@ impl RatingProcessor {
             Field::new("volatility", DataType::Float64, false),
         ]));
         
-        info!("📦 Creating record batch...");
         // Create record batch
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -828,7 +706,6 @@ impl RatingProcessor {
             ],
         ).context("Failed to create Arrow record batch")?;
         
-        info!("✍️  Writing Parquet file to: {}", local_file.display());
         // Write Parquet file
         let file = std::fs::File::create(&local_file)
             .context("Failed to create local Parquet file")?;
@@ -840,34 +717,25 @@ impl RatingProcessor {
         writer.close()
             .context("Failed to close Parquet writer")?;
         
-        info!("✅ Parquet file created successfully");
-        
         // Upload to S3
         let s3_key = format!("persistent/ratings/{}/{}.parquet", self.month_str, time_control);
-        info!("📤 Uploading Parquet file to S3: {}", s3_key);
         self.upload_file(&local_file, &s3_key).await
             .context("Failed to upload Parquet file to S3")?;
         
-        info!("🧹 Removing local Parquet file...");
         fs::remove_file(&local_file).await
             .context("Failed to remove local Parquet file")?;
-        
-        info!("✅ Successfully saved {} player ratings to {}", players.len(), s3_key);
         
         Ok(())
     }
 
     async fn generate_top_rating_lists(&self, players: &HashMap<String, Player>, player_info: &HashMap<String, PlayerInfo>, time_control: &str) -> Result<()> {
-        info!("🏆 Generating top rating lists for {}", time_control);
-        
         // Sort players by rating
-        info!("📊 Sorting players by rating (filtering RD <= 75.0)...");
         let mut sorted_players: Vec<_> = players.values()
             .filter(|p| p.rd <= 75.0) // Only include active players
             .collect();
         sorted_players.sort_by(|a, b| b.rating.partial_cmp(&a.rating).unwrap());
         
-        info!("✅ Found {} active players for top lists", sorted_players.len());
+        info!("Generating top lists from {} active players", sorted_players.len());
         
         // Capture year for use in closures
         let year = self.year;
@@ -887,8 +755,6 @@ impl RatingProcessor {
         ];
         
         for (category, filter_fn) in categories {
-            info!("🎯 Generating {} category list...", category);
-            
             let mut top_players = Vec::new();
             let mut rank = 0u32;
             
@@ -922,8 +788,6 @@ impl RatingProcessor {
             }
             
             if !top_players.is_empty() {
-                info!("💾 Saving {} list with {} players...", category, top_players.len());
-                
                 let local_file = self.temp_dir.join(format!("{}_{}.json", category, time_control));
                 let json_data = serde_json::to_string_pretty(&top_players)
                     .context("Failed to serialize top players to JSON")?;
@@ -932,27 +796,19 @@ impl RatingProcessor {
                 
                 let s3_key = format!("persistent/top_ratings/{}/{}/{}.json", 
                                    self.month_str, time_control, category);
-                info!("📤 Uploading {} list to S3: {}", category, s3_key);
                 self.upload_file(&local_file, &s3_key).await
                     .context("Failed to upload top ratings list to S3")?;
                 
                 fs::remove_file(&local_file).await
                     .context("Failed to remove local JSON file")?;
-                
-                info!("✅ Generated top {} list for {} with {} players", category, time_control, top_players.len());
-            } else {
-                warn!("⚠️  No players found for {} category in {}", category, time_control);
             }
         }
         
-        info!("🏆 All top rating lists generated successfully");
         Ok(())
     }
 
-    // Utility methods
+    // Utility methods with reduced logging
     fn calculate_previous_month(&self, month_str: &str) -> Result<String> {
-        debug!("Calculating previous month for: {}", month_str);
-        
         let year: i32 = month_str[0..4].parse()?;
         let month: u32 = month_str[5..7].parse()?;
         
@@ -962,37 +818,27 @@ impl RatingProcessor {
             (year, month - 1)
         };
         
-        let result = format!("{:04}-{:02}", prev_year, prev_month);
-        debug!("Previous month: {}", result);
-        Ok(result)
+        Ok(format!("{:04}-{:02}", prev_year, prev_month))
     }
 
     async fn decompress_file(&self, compressed_path: &PathBuf, output_path: &PathBuf) -> Result<()> {
         use flate2::read::GzDecoder;
         
-        debug!("Decompressing {} to {}", compressed_path.display(), output_path.display());
-        
         let compressed_data = fs::read(compressed_path).await
             .context("Failed to read compressed file")?;
-        info!("📊 Compressed file size: {} bytes", compressed_data.len());
         
         let mut decoder = GzDecoder::new(&compressed_data[..]);
         let mut decompressed = Vec::new();
         decoder.read_to_end(&mut decompressed)
             .context("Failed to decompress data")?;
         
-        info!("📊 Decompressed size: {} bytes", decompressed.len());
-        
         fs::write(output_path, decompressed).await
             .context("Failed to write decompressed data")?;
         
-        info!("✅ Decompression completed successfully");
         Ok(())
     }
 
     async fn download_file(&self, s3_key: &str, local_path: &PathBuf) -> Result<()> {
-        debug!("📥 Starting S3 download: {} -> {}", s3_key, local_path.display());
-        
         let response = self.s3_client
             .get_object()
             .bucket(&self.s3_bucket)
@@ -1005,22 +851,15 @@ impl RatingProcessor {
             .context("Failed to collect response body from S3")?
             .into_bytes();
         
-        info!("📊 Downloaded {} bytes from S3", data.len());
-        
         fs::write(local_path, data).await
             .context("Failed to write downloaded data to local file")?;
         
-        debug!("✅ Download completed: {}", s3_key);
         Ok(())
     }
 
     async fn upload_file(&self, local_path: &PathBuf, s3_key: &str) -> Result<()> {
-        debug!("📤 Starting S3 upload: {} -> {}", local_path.display(), s3_key);
-        
         let data = fs::read(local_path).await
             .context("Failed to read local file for upload")?;
-        
-        info!("📊 Uploading {} bytes to S3", data.len());
         
         self.s3_client
             .put_object()
@@ -1031,13 +870,10 @@ impl RatingProcessor {
             .await
             .context(format!("Failed to upload file to S3: {}", s3_key))?;
         
-        info!("✅ Successfully uploaded {} to {}", local_path.display(), s3_key);
         Ok(())
     }
 
     async fn check_s3_file_exists(&self, s3_key: &str) -> Result<bool> {
-        debug!("🔍 Checking if S3 file exists: {}", s3_key);
-        
         match self.s3_client
             .head_object()
             .bucket(&self.s3_bucket)
@@ -1045,20 +881,12 @@ impl RatingProcessor {
             .send()
             .await
         {
-            Ok(_) => {
-                debug!("✅ File exists: {}", s3_key);
-                Ok(true)
-            },
-            Err(e) => {
-                debug!("❌ File does not exist or error checking: {} - {}", s3_key, e);
-                Ok(false)
-            }
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false)
         }
     }
 
     async fn upload_processing_completion_marker(&self, results: &[(String, serde_json::Value)]) -> Result<()> {
-        info!("📝 Creating processing completion marker...");
-        
         let completion_data = serde_json::json!({
             "month": self.month_str,
             "timestamp": Utc::now().to_rfc3339(),
@@ -1070,13 +898,11 @@ impl RatingProcessor {
         
         let local_file = self.temp_dir.join(format!("rating_processing_completion_{}.json", self.month_str));
         
-        info!("💾 Writing completion marker to local file...");
         fs::write(&local_file, serde_json::to_string_pretty(&completion_data)?)
             .await
             .context("Failed to write completion marker to local file")?;
         
         let s3_key = format!("results/{}/rating_processing_completion.json", self.month_str);
-        info!("📤 Uploading completion marker to S3: {}", s3_key);
         
         self.upload_file(&local_file, &s3_key).await
             .context("Failed to upload completion marker to S3")?;
@@ -1084,39 +910,26 @@ impl RatingProcessor {
         fs::remove_file(&local_file).await
             .context("Failed to remove local completion marker file")?;
         
-        info!("✅ Processing completion marker uploaded successfully");
         Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("hello from run-glicko main");
-    
     tracing_subscriber::fmt()
         .with_target(false)
-        .with_thread_ids(true)
+        .with_thread_ids(false)
         .with_level(true)
         .init();
     
     let args = Args::parse();
     
-    info!("🚀 Starting Rating Processor");
-    info!("📋 Configuration:");
-    info!("  - Month: {}", args.month);
-    info!("  - S3 Bucket: {}", args.s3_bucket);
-    info!("  - AWS Region: {}", args.aws_region);
-    info!("  - Workers: {}", args.workers);
+    info!("Starting Rating Processor for {}", args.month);
     
     // Validate month format
-    info!("🔍 Validating month format...");
     chrono::NaiveDate::parse_from_str(&format!("{}-01", args.month), "%Y-%m-%d")
         .context("Month must be in YYYY-MM format")?;
-    info!("✅ Month format is valid");
     
-    let month_str = args.month.clone(); // Clone before move
-    
-    info!("🏗️  Initializing processor...");
     let processor = RatingProcessor::new(
         args.s3_bucket,
         args.aws_region,
@@ -1124,15 +937,13 @@ async fn main() -> Result<()> {
         args.workers,
     ).await?;
     
-    info!("🎯 Starting processing for month: {}", month_str);
     match processor.process_ratings_for_month().await {
         Ok(()) => {
-            info!("🎉 Rating processing completed successfully!");
+            info!("Rating processing completed successfully!");
             Ok(())
         }
         Err(e) => {
-            error!("💥 Processing failed with error: {}", e);
-            error!("🔍 Error details: {:?}", e);
+            error!("Processing failed: {}", e);
             
             // Print the error chain for better debugging
             let mut current_error = e.source();
