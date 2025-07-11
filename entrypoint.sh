@@ -205,7 +205,7 @@ run_glicko_only_pipeline() {
     
     log "Binary test passed, running with full parameters..."
     
-    # Set multiple Rust logging levels
+    # Set Rust logging levels
     export RUST_LOG=debug
     export RUST_BACKTRACE=1
     
@@ -213,43 +213,38 @@ run_glicko_only_pipeline() {
     log "  RUST_LOG=$RUST_LOG"
     log "  RUST_BACKTRACE=$RUST_BACKTRACE"
     
-    # Try a more verbose approach - run directly with strace to see what's happening
-    log "Attempting to trace system calls..."
-    
-    # First try with timeout to prevent hanging
-    log "Running with 30 second timeout..."
+    # Simplified approach - just capture the error directly
+    log "Running run-glicko and capturing output..."
     set +e  # Don't exit on error
-    if timeout 30 strace -o /tmp/strace.log -e trace=write,openat,execve run-glicko \
+    
+    # Run without timeout first to get the actual error
+    output=$(run-glicko \
         --month "$PROCESS_MONTH" \
         --s3-bucket "$S3_BUCKET" \
-        --aws-region "$AWS_REGION" > /tmp/run-glicko.out 2>&1; then
-        exit_code=0
-    else
-        exit_code=$?
-    fi
+        --aws-region "$AWS_REGION" 2>&1)
+    exit_code=$?
+    
     set -e  # Re-enable exit on error
     
     log "run-glicko exit code: $exit_code"
-    
-    # Show output files
-    if [ -f /tmp/run-glicko.out ]; then
-        output_size=$(wc -c < /tmp/run-glicko.out)
-        log "Output file size: $output_size bytes"
-        if [ $output_size -gt 0 ]; then
-            log "run-glicko output:"
-            cat /tmp/run-glicko.out
-        else
-            log "Output file is empty"
-        fi
+    if [ -n "$output" ]; then
+        log "run-glicko output:"
+        echo "$output"
+        log "--- End of output ---"
+    else
+        log "run-glicko produced no output"
     fi
     
-    if [ -f /tmp/strace.log ]; then
-        log "System call trace (last 20 lines):"
-        tail -20 /tmp/strace.log
+    # Check binary dependencies if it failed
+    if [ $exit_code -eq 127 ]; then
+        log "Exit code 127 indicates command not found or missing dependency"
+        log "Checking binary dependencies:"
+        ldd /app/bin/run-glicko || log "ldd command failed"
+        log "Checking if binary is executable:"
+        file /app/bin/run-glicko || log "file command failed"
+        log "Trying to run binary directly:"
+        /app/bin/run-glicko --help || log "Direct execution failed with code: $?"
     fi
-    
-    # Cleanup
-    rm -f /tmp/run-glicko.out /tmp/strace.log
 
     if [ $exit_code -ne 0 ]; then
         log "ERROR: Rating calculation failed with exit code $exit_code"
