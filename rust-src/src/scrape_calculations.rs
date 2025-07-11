@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Result};
 use aws_sdk_s3::Client as S3Client;
 use aws_types::region::Region;
 use clap::Parser;

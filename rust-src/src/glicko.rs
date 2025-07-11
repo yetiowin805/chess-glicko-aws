@@ -367,23 +367,21 @@ impl RatingProcessor {
                 .context("Failed to read volatility column")?;
             
             for i in 0..batch.num_rows() {
-                if let (Some(id), Some(rating), Some(rd), Some(volatility)) = (
-                    player_ids.value(i).to_string(),
-                    ratings.value(i),
-                    rds.value(i), 
-                    volatilities.value(i)
-                ) {
-                    players.insert(id.clone(), Player {
-                        id,
-                        rating,
-                        rd,
-                        volatility,
-                        new_rating: rating,
-                        new_rd: rd,
-                        new_volatility: volatility,
-                        games: Vec::new(),
-                    });
-                }
+                let id = player_ids.value(i).to_string();
+                let rating = ratings.value(i);
+                let rd = rds.value(i);
+                let volatility = volatilities.value(i);
+                
+                players.insert(id.clone(), Player {
+                    id,
+                    rating,
+                    rd,
+                    volatility,
+                    new_rating: rating,
+                    new_rd: rd,
+                    new_volatility: volatility,
+                    games: Vec::new(),
+                });
             }
         }
         

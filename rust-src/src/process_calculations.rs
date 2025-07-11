@@ -1,20 +1,18 @@
 use anyhow::{Context, Result};
-use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client as S3Client;
 use aws_types::region::Region;
-use chrono::{DateTime, Utc};
+use chrono::{Utc};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use tokio::fs;
 use tracing::{error, info, warn};
 use regex::Regex;
-use rusqlite::{Connection, Result as SqliteResult};
+use rusqlite::{Connection};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use flate2::read::GzDecoder;
 
 // Binary format constants
 const MAGIC_HEADER: &[u8; 8] = b"CHSSGAME";
