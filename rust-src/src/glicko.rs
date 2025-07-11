@@ -575,7 +575,7 @@ impl RatingProcessor {
             // Move downward until f(B) < 0
             let mut k = 1.0;
             loop {
-                if f(a - k * TAU) < 0.0 {
+                if f(a - k * TAU) >= 0.0 {
                     break;
                 }
                 k += 1.0;
