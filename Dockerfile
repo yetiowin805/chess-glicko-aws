@@ -19,12 +19,13 @@ RUN mkdir -p src && echo "fn main() {}" > src/process_calculations.rs
 RUN mkdir -p src && echo "fn main() {}" > src/glicko.rs
 
 # Build dependencies first (this layer will be cached)
-RUN cargo build --release && rm -rf src target/release/deps/calculation* target/release/deps/run-glicko*
+# Delete the entire target directory to ensure stubs don't survive
+RUN cargo build --release && rm -rf src target
 
 # Now copy actual source code
 COPY rust-src/src ./src
 
-# Build all three binaries
+# Build all three binaries from scratch with real source
 RUN cargo build --release --bin calculation-scraper
 RUN cargo build --release --bin calculation-processor
 RUN cargo build --release --bin run-glicko
