@@ -2,24 +2,25 @@ use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client as S3Client;
 use aws_types::region::Region;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use clap::Parser;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::fs;
 use tracing::{debug, error, info, warn};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
-use rusqlite::{Connection, Result as SqliteResult};
+use rusqlite::Connection;
 
 // Parquet/Arrow imports
-use arrow::array::{Float64Array, StringArray, UInt32Array, UInt64Array};
+use arrow::array::{Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
 
 // Binary format constants (matching calculation processor)
@@ -153,7 +154,7 @@ impl RatingProcessor {
         info!("  - Workers: {}", workers);
 
         debug!("Loading AWS configuration...");
-        let config = aws_config::from_env()
+        let config = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(aws_region.clone()))
             .load()
             .await;
@@ -341,7 +342,7 @@ impl RatingProcessor {
         // Read Parquet file using Arrow
         let file = std::fs::File::open(&local_file)
             .context("Failed to open local Parquet file")?;
-        let builder = parquet::arrow::ParquetRecordBatchReaderBuilder::try_new(file)
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .context("Failed to create Parquet reader builder")?;
         let reader = builder.build()
             .context("Failed to build Parquet reader")?;
@@ -454,26 +455,34 @@ impl RatingProcessor {
             error!("❌ Invalid magic header in binary file");
             anyhow::bail!("Invalid magic header in binary file");
         }
-        if header.version != FORMAT_VERSION {
-            error!("❌ Unsupported file version: {}", header.version);
-            anyhow::bail!("Unsupported file version: {}", header.version);
+        
+        // Copy packed struct fields to local variables to avoid unaligned access
+        let version = header.version;
+        let player_count = header.player_count;
+        let total_games = header.total_games;
+        let time_control = header.time_control;
+        let timestamp = header.timestamp;
+        
+        if version != FORMAT_VERSION {
+            error!("❌ Unsupported file version: {}", version);
+            anyhow::bail!("Unsupported file version: {}", version);
         }
         
         info!("✅ File format verified successfully");
         info!("📊 File contains:");
-        info!("  - Players: {}", header.player_count);
-        info!("  - Total games: {}", header.total_games);
-        info!("  - Time control: {}", header.time_control);
-        info!("  - Timestamp: {}", header.timestamp);
+        info!("  - Players: {}", player_count);
+        info!("  - Total games: {}", total_games);
+        info!("  - Time control: {}", time_control);
+        info!("  - Timestamp: {}", timestamp);
         
         let mut total_games_loaded = 0u64;
         let mut processed_players = 0u32;
         
         // Read player data
         info!("👥 Processing player data...");
-        for player_idx in 0..header.player_count {
+        for player_idx in 0..player_count {
             if player_idx % 1000 == 0 {
-                debug!("Processing player {}/{}", player_idx, header.player_count);
+                debug!("Processing player {}/{}", player_idx, player_count);
             }
             
             // Read player header
@@ -636,7 +645,7 @@ impl RatingProcessor {
         let delta = v * delta_sum;
         
         // Simplified volatility update
-        let a = (player.volatility * player.volatility).ln();
+        let _a = (player.volatility * player.volatility).ln();
         let new_volatility = if delta * delta > phi * phi + v {
             ((delta * delta - phi * phi - v).ln() / 2.0).exp()
         } else {
@@ -852,18 +861,21 @@ impl RatingProcessor {
         
         info!("✅ Found {} active players for top lists", sorted_players.len());
         
-        // Generate different categories
-        let categories = vec![
-            ("open", |_p: &Player, _info: Option<&PlayerInfo>| true),
-            ("women", |_p: &Player, info: Option<&PlayerInfo>| {
+        // Capture year for use in closures
+        let year = self.year;
+        
+        // Generate different categories using boxed closures
+        let categories: Vec<(&str, Box<dyn Fn(&Player, Option<&PlayerInfo>) -> bool + Send + Sync>)> = vec![
+            ("open", Box::new(|_p: &Player, _info: Option<&PlayerInfo>| true)),
+            ("women", Box::new(|_p: &Player, info: Option<&PlayerInfo>| {
                 info.map_or(false, |i| i.sex == "F")
-            }),
-            ("juniors", |_p: &Player, info: Option<&PlayerInfo>| {
-                info.map_or(false, |i| self.year - i.birth_year as i32 <= 20)
-            }),
-            ("girls", |_p: &Player, info: Option<&PlayerInfo>| {
-                info.map_or(false, |i| i.sex == "F" && self.year - i.birth_year as i32 <= 20)
-            }),
+            })),
+            ("juniors", Box::new(move |_p: &Player, info: Option<&PlayerInfo>| {
+                info.map_or(false, |i| year - i.birth_year as i32 <= 20)
+            })),
+            ("girls", Box::new(move |_p: &Player, info: Option<&PlayerInfo>| {
+                info.map_or(false, |i| i.sex == "F" && year - i.birth_year as i32 <= 20)
+            })),
         ];
         
         for (category, filter_fn) in categories {
@@ -1094,6 +1106,8 @@ async fn main() -> Result<()> {
         .context("Month must be in YYYY-MM format")?;
     info!("✅ Month format is valid");
     
+    let month_str = args.month.clone(); // Clone before move
+    
     info!("🏗️  Initializing processor...");
     let processor = RatingProcessor::new(
         args.s3_bucket,
@@ -1102,7 +1116,7 @@ async fn main() -> Result<()> {
         args.workers,
     ).await?;
     
-    info!("🎯 Starting processing for month: {}", args.month);
+    info!("🎯 Starting processing for month: {}", month_str);
     match processor.process_ratings_for_month().await {
         Ok(()) => {
             info!("🎉 Rating processing completed successfully!");
