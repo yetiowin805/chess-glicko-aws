@@ -555,24 +555,69 @@ impl RatingProcessor {
         let v = 1.0 / v_inv;
         let delta = v * delta_sum;
         
-        // Simplified volatility update
-        let _a = (player.volatility * player.volatility).ln();
-        let new_volatility = if delta * delta > phi * phi + v {
-            ((delta * delta - phi * phi - v).ln() / 2.0).exp()
+        let a  = (player.volatility * player.volatility).ln();   // ln σ²  (σ ≡ volatility)
+        let mut A = a;
+        let mut B;
+
+        if delta * delta > phi * phi + v {
+            // Initial upper bound per the paper
+            B = (delta * delta - phi * phi - v).ln();
         } else {
-            player.volatility
-        }.min(MAX_VOLATILITY);
-        
+            // Move downward until f(B) < 0
+            let mut k = 1.0;
+            loop {
+                B = a - k * TAU;
+                let exp_b   = B.exp();
+                let f_b = (exp_b * (delta * delta - phi * phi - v - exp_b))
+                        / (2.0 * (phi * phi + v + exp_b).powi(2))
+                        - (B - a) / (TAU * TAU);
+                if f_b < 0.0 { break; }
+                k += 1.0;
+            }
+        }
+
+        // Helper lambdas kept local
+        let f = |x: f64| {
+            let exp_x = x.exp();
+            (exp_x * (delta * delta - phi * phi - v - exp_x))
+                / (2.0 * (phi * phi + v + exp_x).powi(2))
+                - (x - a) / (TAU * TAU)
+        };
+
+        let mut f_a = f(A);
+        let mut f_b = f(B);
+
+        while (B - A).abs() > EPS {
+            // Illinois variant of the secant method (used by Glickman)
+            let C  = A + (A - B) * f_a / (f_b - f_a);
+            let f_c = f(C);
+
+            if f_c * f_b < 0.0 {
+                A  = B;
+                f_a = f_b;
+            } else {
+                f_a /= 2.0;     // halve to ensure convergence
+            }
+            B  = C;
+            f_b = f_c;
+        }
+
+        let new_sigma = ((A + B) / 2.0 / 2.0).exp();   // σ′ = exp(x / 2) with x ≈ (A+B)/2
+        let new_volatility = new_sigma.min(MAX_VOLATILITY);
+
         let phi_star = (phi * phi + new_volatility * new_volatility).sqrt();
-        let new_phi = 1.0 / (1.0 / (phi_star * phi_star) + 1.0 / v).sqrt();
-        
-        // Rating update with bounds
-        let rating_change = new_phi * new_phi * delta_sum;
-        let bounded_change = rating_change.max(-1000.0 / SCALE).min(1000.0 / SCALE);
+        let new_phi  = 1.0 / (1.0 / (phi_star * phi_star) + 1.0 / v).sqrt();
+
+        // Bounded rating change
+        let rating_change   = new_phi * new_phi * delta_sum;
+        let bounded_change  = rating_change
+            .max(-700.0 / SCALE)
+            .min( 700.0 / SCALE);
+
         let new_mu = mu + bounded_change;
-        
-        player.new_rating = new_mu * SCALE + BASE_RATING;
-        player.new_rd = (new_phi * SCALE).min(MAX_RD);
+
+        player.new_rating    = new_mu * SCALE + BASE_RATING;
+        player.new_rd        = (new_phi * SCALE).min(MAX_RD);
         player.new_volatility = new_volatility;
     }
 
