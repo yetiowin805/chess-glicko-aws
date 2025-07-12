@@ -483,8 +483,11 @@ impl RatingProcessor {
                     _ => continue, // Invalid result
                 };
                 
+                // Copy opponent_id_hash to avoid unaligned access to packed struct
+                let opponent_id_hash = game_record.opponent_id_hash;
+                
                 // Look up opponent by hash in previous month's ratings
-                let (opponent_rating, opponent_rd) = if let Some(opponent_id) = hash_to_player_id.get(&game_record.opponent_id_hash) {
+                let (opponent_rating, opponent_rd) = if let Some(opponent_id) = hash_to_player_id.get(&opponent_id_hash) {
                     if let Some(opponent_player) = previous_ratings.get(opponent_id) {
                         opponents_found += 1;
                         (opponent_player.rating, opponent_player.rd)
@@ -499,7 +502,7 @@ impl RatingProcessor {
                     opponents_not_found += 1;
                     if opponents_not_found <= 100 { // Limit warnings to avoid spam
                         warn!("Opponent with hash {} not found in previous month's ratings database, using default rating {}", 
-                              game_record.opponent_id_hash, BASE_RATING);
+                              opponent_id_hash, BASE_RATING);
                     }
                     (BASE_RATING, BASE_RD)
                 };
