@@ -301,7 +301,8 @@ impl RatingProcessor {
     }
 
     async fn load_ratings_from_parquet(&self, s3_key: &str) -> Result<HashMap<String, Player>> {
-        let local_file = self.temp_dir.join("previous_ratings.parquet");
+        let local_file = self.temp_dir.join(format!("previous_ratings_{}.parquet", 
+            s3_key.replace("/", "_").replace(":", "")));
         
         self.download_file(s3_key, &local_file).await
             .context("Failed to download previous ratings file")?;
