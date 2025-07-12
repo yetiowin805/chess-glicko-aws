@@ -517,6 +517,22 @@ impl RatingProcessor {
                 player.games.push(game_result);
                 total_games_loaded += 1;
             }
+            
+            // Log sample game for debugging
+            if !player.games.is_empty() {
+                let first_game = &player.games[0];
+                let result_str = match first_game.score {
+                    0.0 => "Loss",
+                    0.5 => "Draw", 
+                    1.0 => "Win",
+                    _ => "Unknown"
+                };
+                info!("Player {}: {} games, sample game: {} vs opponent (rating: {:.0}, RD: {:.0})", 
+                      player.id, player.games.len(), result_str, first_game.opponent_rating, first_game.opponent_rd);
+            } else {
+                info!("Player {}: no games", player.id);
+            }
+            
         }
         
         info!("Opponent lookup stats: {} found, {} not found ({}% found)", 
