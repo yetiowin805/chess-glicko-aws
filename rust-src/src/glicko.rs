@@ -15,6 +15,8 @@ use tracing::{error, info, warn};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::Connection;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 
 // Parquet/Arrow imports
 use arrow::array::{Float64Array, StringArray};
@@ -371,8 +373,11 @@ impl RatingProcessor {
         self.decompress_file(&compressed_file, &binary_file).await
             .context("Failed to decompress binary file")?;
         
+        // Clone the current players HashMap for opponent lookup (contains previous month's ratings)
+        let previous_ratings = players.clone();
+        
         // Read binary file
-        let games_loaded = self.read_binary_games_file(&binary_file, players).await
+        let games_loaded = self.read_binary_games_file(&binary_file, players, &previous_ratings).await
             .context("Failed to read binary games file")?;
         
         // Cleanup
@@ -384,7 +389,20 @@ impl RatingProcessor {
         Ok(games_loaded)
     }
 
-    async fn read_binary_games_file(&self, file_path: &PathBuf, players: &mut HashMap<String, Player>) -> Result<u64> {
+    fn create_player_id_hash_map(&self, players: &HashMap<String, Player>) -> HashMap<u64, String> {
+        let mut hash_map = HashMap::new();
+        
+        for player_id in players.keys() {
+            let mut hasher = DefaultHasher::new();
+            player_id.hash(&mut hasher);
+            let hash = hasher.finish();
+            hash_map.insert(hash, player_id.clone());
+        }
+        
+        hash_map
+    }
+
+    async fn read_binary_games_file(&self, file_path: &PathBuf, players: &mut HashMap<String, Player>, previous_ratings: &HashMap<String, Player>) -> Result<u64> {
         let file = std::fs::File::open(file_path)
             .context("Failed to open binary games file")?;
         let mut reader = BufReader::new(file);
@@ -411,7 +429,13 @@ impl RatingProcessor {
         
         info!("Processing {} players with {} total games", player_count, total_games);
         
+        // Create hash-to-player-ID mapping for opponent lookup
+        let hash_to_player_id = self.create_player_id_hash_map(previous_ratings);
+        info!("Created hash mapping for {} previous month players", hash_to_player_id.len());
+        
         let mut total_games_loaded = 0u64;
+        let mut opponents_not_found = 0u64;
+        let mut opponents_found = 0u64;
         
         // Read player data
         for player_idx in 0..player_count {
@@ -459,22 +483,48 @@ impl RatingProcessor {
                     _ => continue, // Invalid result
                 };
                 
-                // Use opponent rating if available, otherwise use default
-                let opponent_rating = if game_record.opponent_rating > 0 {
-                    game_record.opponent_rating as f64
+                // Look up opponent by hash in previous month's ratings
+                let (opponent_rating, opponent_rd) = if let Some(opponent_id) = hash_to_player_id.get(&game_record.opponent_id_hash) {
+                    if let Some(opponent_player) = previous_ratings.get(opponent_id) {
+                        opponents_found += 1;
+                        (opponent_player.rating, opponent_player.rd)
+                    } else {
+                        // This should not happen since we created the hash map from previous_ratings
+                        warn!("Opponent ID {} found in hash map but not in previous ratings", opponent_id);
+                        opponents_not_found += 1;
+                        (BASE_RATING, BASE_RD)
+                    }
                 } else {
-                    BASE_RATING
+                    // Opponent not found in previous month's database
+                    opponents_not_found += 1;
+                    if opponents_not_found <= 100 { // Limit warnings to avoid spam
+                        warn!("Opponent with hash {} not found in previous month's ratings database, using default rating {}", 
+                              game_record.opponent_id_hash, BASE_RATING);
+                    }
+                    (BASE_RATING, BASE_RD)
                 };
                 
                 let game_result = GameResult {
                     opponent_rating,
-                    opponent_rd: BASE_RD, // Default RD for opponents
+                    opponent_rd,
                     score,
                 };
                 
                 player.games.push(game_result);
                 total_games_loaded += 1;
             }
+        }
+        
+        info!("Opponent lookup stats: {} found, {} not found ({}% found)", 
+              opponents_found, opponents_not_found, 
+              if opponents_found + opponents_not_found > 0 { 
+                  (opponents_found * 100) / (opponents_found + opponents_not_found) 
+              } else { 
+                  0 
+              });
+        
+        if opponents_not_found > 100 {
+            warn!("Total of {} opponents not found in previous month's database (showing only first 100 warnings)", opponents_not_found);
         }
         
         Ok(total_games_loaded)
