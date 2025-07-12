@@ -45,8 +45,14 @@ const PI_SQUARED: f64 = std::f64::consts::PI * std::f64::consts::PI;
 #[command(name = "run-glicko")]
 #[command(about = "Process binary game data and update Glicko-2 ratings")]
 struct Args {
-    #[arg(short, long, help = "Month for processing in YYYY-MM format")]
-    month: String,
+    #[arg(short, long, help = "Month for processing in YYYY-MM format (mutually exclusive with --first-month/--last-month)")]
+    month: Option<String>,
+    
+    #[arg(long, help = "First month for batch processing in YYYY-MM format")]
+    first_month: Option<String>,
+    
+    #[arg(long, help = "Last month for batch processing in YYYY-MM format")]
+    last_month: Option<String>,
     
     #[arg(long, help = "S3 bucket for data storage")]
     s3_bucket: String,
@@ -56,6 +62,43 @@ struct Args {
     
     #[arg(long, default_value = "4", help = "Number of worker threads for parallel processing")]
     workers: usize,
+}
+
+// Function to generate month range
+fn generate_month_range(first_month: &str, last_month: &str) -> Result<Vec<String>> {
+    let first_date = chrono::NaiveDate::parse_from_str(&format!("{}-01", first_month), "%Y-%m-%d")
+        .context("First month must be in YYYY-MM format")?;
+    let last_date = chrono::NaiveDate::parse_from_str(&format!("{}-01", last_month), "%Y-%m-%d")
+        .context("Last month must be in YYYY-MM format")?;
+    
+    if first_date > last_date {
+        anyhow::bail!("First month must be less than or equal to last month");
+    }
+    
+    let mut months = Vec::new();
+    let mut current_date = first_date;
+    
+    while current_date <= last_date {
+        months.push(current_date.format("%Y-%m").to_string());
+        
+        // Move to next month
+        current_date = if current_date.month() == 12 {
+            chrono::NaiveDate::from_ymd_opt(current_date.year() + 1, 1, 1)
+                .context("Failed to calculate next year")?
+        } else {
+            chrono::NaiveDate::from_ymd_opt(current_date.year(), current_date.month() + 1, 1)
+                .context("Failed to calculate next month")?
+        };
+    }
+    
+    Ok(months)
+}
+
+// Function to validate month format
+fn validate_month_format(month: &str) -> Result<()> {
+    chrono::NaiveDate::parse_from_str(&format!("{}-01", month), "%Y-%m-%d")
+        .context("Month must be in YYYY-MM format")?;
+    Ok(())
 }
 
 // Binary format structures (matching calculation processor)
@@ -1043,37 +1086,63 @@ async fn main() -> Result<()> {
     
     let args = Args::parse();
     
-    info!("Starting Rating Processor for {}", args.month);
-    
-    // Validate month format
-    chrono::NaiveDate::parse_from_str(&format!("{}-01", args.month), "%Y-%m-%d")
-        .context("Month must be in YYYY-MM format")?;
-    
-    let processor = RatingProcessor::new(
-        args.s3_bucket,
-        args.aws_region,
-        args.month,
-        args.workers,
-    ).await?;
-    
-    match processor.process_ratings_for_month().await {
-        Ok(()) => {
-            info!("Rating processing completed successfully!");
-            Ok(())
+    // Validate argument combinations
+    let months_to_process = match (&args.month, &args.first_month, &args.last_month) {
+        (Some(month), None, None) => {
+            // Single month mode
+            validate_month_format(month)?;
+            info!("Starting Rating Processor for single month: {}", month);
+            vec![month.clone()]
+        },
+        (None, Some(first_month), Some(last_month)) => {
+            // Range mode
+            validate_month_format(first_month)?;
+            validate_month_format(last_month)?;
+            let months = generate_month_range(first_month, last_month)?;
+            info!("Starting Rating Processor for {} months: {} to {}", months.len(), first_month, last_month);
+            months
+        },
+        _ => {
+            anyhow::bail!("Invalid argument combination. Use either --month for single month processing, or --first-month and --last-month for range processing.");
         }
-        Err(e) => {
-            error!("Processing failed: {}", e);
-            
-            // Print the error chain for better debugging
-            let mut current_error = e.source();
-            let mut level = 1;
-            while let Some(err) = current_error {
-                error!("  {}. Caused by: {}", level, err);
-                current_error = err.source();
-                level += 1;
+    };
+    
+    info!("Processing {} month(s)", months_to_process.len());
+    
+    // Process each month in sequence
+    for (index, month_str) in months_to_process.iter().enumerate() {
+        info!("Processing month {}/{}: {}", index + 1, months_to_process.len(), month_str);
+        
+        let processor = RatingProcessor::new(
+            args.s3_bucket.clone(),
+            args.aws_region.clone(),
+            month_str.clone(),
+            args.workers,
+        ).await?;
+        
+        match processor.process_ratings_for_month().await {
+            Ok(()) => {
+                info!("Rating processing completed successfully for {} ({}/{})", 
+                      month_str, index + 1, months_to_process.len());
             }
-            
-            std::process::exit(1);
+            Err(e) => {
+                error!("Processing failed for {} ({}/{}): {}", 
+                       month_str, index + 1, months_to_process.len(), e);
+                
+                // Print the error chain for better debugging
+                let mut current_error = e.source();
+                let mut level = 1;
+                while let Some(err) = current_error {
+                    error!("  {}. Caused by: {}", level, err);
+                    current_error = err.source();
+                    level += 1;
+                }
+                
+                std::process::exit(1);
+            }
         }
     }
+    
+    info!("All {} month(s) processed successfully!", months_to_process.len());
+    Ok(())
 }
