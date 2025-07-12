@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client as S3Client;
 use aws_types::region::Region;
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use clap::Parser;
 use futures::future;
 use serde::Serialize;
