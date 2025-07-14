@@ -566,10 +566,6 @@ impl RatingProcessor {
                     1.0 => "Win",
                     _ => "Unknown"
                 };
-                info!("Player {}: {} games, sample game: {} vs opponent (rating: {:.0}, RD: {:.0})", 
-                      player.id, player.games.len(), result_str, first_game.opponent_rating, first_game.opponent_rd);
-            } else {
-                info!("Player {}: no games", player.id);
             }
             
         }
@@ -745,6 +741,9 @@ impl RatingProcessor {
                                database_time_control, database_month);
         let local_db = self.temp_dir.join(format!("player_info_{}_{}.db", database_month, time_control));
         
+        info!("Loading player info from database: {} (time_control: {}, database_month: {}, database_time_control: {})", 
+              db_s3_key, time_control, database_month, database_time_control);
+        
         if !self.check_s3_file_exists(&db_s3_key).await? {
             warn!("No player info database found for {}", time_control);
             return Ok(HashMap::new());
@@ -764,14 +763,30 @@ impl RatingProcessor {
                     .context("Failed to prepare player info query")?;
                 
                 let mut player_info = HashMap::new();
+                let mut total_records = 0;
+                let mut null_names = 0;
+                let mut null_birth_years = 0;
+                let mut empty_names = 0;
+                
                 let player_iter = stmt.query_map([], |row| {
+                    total_records += 1;
+                    
                     // Handle NULL birth_year gracefully
                     let birth_year_result: Result<u32, _> = row.get(4);
                     let birth_year = birth_year_result.ok(); // Convert error to None
                     
+                    if birth_year.is_none() {
+                        null_birth_years += 1;
+                    }
+                    
+                    let name: String = row.get(1)?;
+                    if name.is_empty() {
+                        empty_names += 1;
+                    }
+                    
                     Ok(PlayerInfo {
                         id: row.get(0)?,
-                        name: row.get(1)?,
+                        name,
                         federation: row.get(2)?,
                         sex: row.get(3)?,
                         birth_year,
@@ -782,6 +797,9 @@ impl RatingProcessor {
                     let player = player_result.context("Failed to read player info row")?;
                     player_info.insert(player.id.clone(), player);
                 }
+                
+                info!("Player info database stats: {} total records, {} null birth years, {} empty names", 
+                      total_records, null_birth_years, empty_names);
                 
                 Ok(player_info)
             }
@@ -892,7 +910,24 @@ impl RatingProcessor {
             .collect();
         sorted_players.sort_by(|a, b| b.rating.partial_cmp(&a.rating).unwrap());
         
-        info!("Generating top lists from {} active players", sorted_players.len());
+        info!("Generating top lists from {} active players (RD <= 75.0) out of {} total players", 
+              sorted_players.len(), players.len());
+        
+        // Debug: Check top 10 players for missing info
+        info!("Top 10 players info lookup status:");
+        for (i, player) in sorted_players.iter().take(10).enumerate() {
+            let info = player_info.get(&player.id);
+            match info {
+                Some(info) => {
+                    info!("  {}. {} (rating: {:.0}) - Name: '{}', Fed: '{}', Sex: '{}', Birth: {:?}", 
+                          i + 1, player.id, player.rating, info.name, info.federation, info.sex, info.birth_year);
+                }
+                None => {
+                    warn!("  {}. {} (rating: {:.0}) - NO INFO FOUND in player database", 
+                          i + 1, player.id, player.rating);
+                }
+            }
+        }
         
         // Capture year for use in closures
         let year = self.year;
@@ -915,12 +950,34 @@ impl RatingProcessor {
         for (category, filter_fn) in categories {
             let mut top_players = Vec::new();
             let mut rank = 0u32;
+            let mut missing_info_count = 0;
+            let mut empty_name_count = 0;
             
             for player in &sorted_players {
                 let info = player_info.get(&player.id);
                 
                 if filter_fn(player, info) {
                     rank += 1;
+                    
+                    // Track missing info issues
+                    match info {
+                        Some(player_info) => {
+                            if player_info.name.is_empty() {
+                                empty_name_count += 1;
+                                if rank <= 20 { // Log first 20 occurrences
+                                    warn!("Player {} (rank {}) has empty name in {} category", 
+                                          player.id, rank, category);
+                                }
+                            }
+                        }
+                        None => {
+                            missing_info_count += 1;
+                            if rank <= 20 { // Log first 20 occurrences
+                                warn!("Player {} (rank {}) has no info record in {} category", 
+                                      player.id, rank, category);
+                            }
+                        }
+                    }
                     
                     let entry = TopRatingEntry {
                         rank,
@@ -945,6 +1002,11 @@ impl RatingProcessor {
                 }
             }
             
+            if missing_info_count > 0 || empty_name_count > 0 {
+                warn!("Category '{}': {} players missing info records, {} players with empty names", 
+                      category, missing_info_count, empty_name_count);
+            }
+            
             if !top_players.is_empty() {
                 let local_file = self.temp_dir.join(format!("{}_{}.json", category, time_control));
                 let json_data = serde_json::to_string_pretty(&top_players)
@@ -959,6 +1021,8 @@ impl RatingProcessor {
                 
                 fs::remove_file(&local_file).await
                     .context("Failed to remove local JSON file")?;
+                
+                info!("Generated {} category with {} players", category, top_players.len());
             }
         }
         
