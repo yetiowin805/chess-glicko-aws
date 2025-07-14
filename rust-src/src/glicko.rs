@@ -799,21 +799,21 @@ impl RatingProcessor {
         let result = if year < 2009 || (year == 2009 && month < 9) {
             // 3-month periods
             match month {
-                1 | 2 | 3 => format!("{}-01", year),      // Feb/Mar use Jan database
-                4 | 5 | 6 => format!("{}-04", year),      // May/Jun use Apr database
-                7 | 8 | 9 => format!("{}-07", year),      // Aug/Sep use Jul database
-                10 | 11 | 12 => format!("{}-10", year),   // Oct uses Oct database
-                _ => month_str.to_string(),              // Non-period month
+                11 | 12 | 1 => format!("{}-01", year), 
+                2 | 3 | 4 => format!("{}-04", year),    
+                5 | 6 | 7 => format!("{}-07", year),   
+                8 | 9 | 10 => format!("{}-10", year), 
+                _ => month_str.to_string(),            
             }
         } else if year < 2012 || (year == 2012 && month < 8) {
             // 2-month periods (odd months are period-ending months)
             match month {
-                1 | 2 => format!("{}-01", year),          // Jan uses Jan database
-                3 | 4 => format!("{}-03", year),          // Mar uses Mar database
-                5 | 6 => format!("{}-05", year),          // May uses May database
-                7 | 8 => format!("{}-07", year),          // Jul uses Jul database
-                9 | 10 => format!("{}-09", year),         // Sep uses Sep database
-                11 | 12 => format!("{}-11", year),        // Nov uses Nov database
+                12 | 1 => format!("{}-01", year),         
+                2 | 3 => format!("{}-03", year),         
+                4 | 5 => format!("{}-05", year),         
+                6 | 7 => format!("{}-07", year),         
+                8 | 9 => format!("{}-09", year),        
+                10 | 11 => format!("{}-11", year),        
                 _ => month_str.to_string(),
             }
         } else {
@@ -921,27 +921,12 @@ impl RatingProcessor {
                 let info = player_info.get(&player.id);
                 
                 if filter_fn(player, info) {
-                    rank += 1;
-                    
-                    // Track missing info issues
-                    match info {
-                        Some(player_info) => {
-                            if player_info.name.is_empty() {
-                                empty_name_count += 1;
-                                if rank <= 20 { // Log first 20 occurrences
-                                    warn!("Player {} (rank {}) has empty name in {} category", 
-                                          player.id, rank, category);
-                                }
-                            }
-                        }
-                        None => {
-                            missing_info_count += 1;
-                            if rank <= 20 { // Log first 20 occurrences
-                                warn!("Player {} (rank {}) has no info record in {} category", 
-                                      player.id, rank, category);
-                            }
-                        }
+                    // Skip players with no info found
+                    if info.is_none() {
+                        continue;
                     }
+                    
+                    rank += 1;
                     
                     let entry = TopRatingEntry {
                         rank,
@@ -970,11 +955,6 @@ impl RatingProcessor {
                         break;
                     }
                 }
-            }
-            
-            if missing_info_count > 0 || empty_name_count > 0 {
-                warn!("Category '{}': {} players missing info records, {} players with empty names", 
-                      category, missing_info_count, empty_name_count);
             }
             
             if !top_players.is_empty() {
