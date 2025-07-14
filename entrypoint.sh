@@ -7,6 +7,12 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
+# Check if we're being called with run-glicko arguments (for glicko_only mode with month ranges)
+if [ "$1" = "run-glicko" ] || [ "$1" = "/app/bin/run-glicko" ]; then
+    log "Detected run-glicko command, executing directly..."
+    exec "$@"
+fi
+
 # Function to check if a month is a valid FIDE rating period
 is_valid_rating_period() {
     local year=$1
@@ -65,8 +71,15 @@ PIPELINE_MODE=${PIPELINE_MODE:-full}
 
 # Get process month from environment or calculate it
 if [ -z "$PROCESS_MONTH" ]; then
-    # Default to previous month
-    PROCESS_MONTH=$(date -d "$(date +'%Y-%m-01') -1 month" +'%Y-%m')
+    if [ "$PIPELINE_MODE" = "glicko_only" ]; then
+        # For glicko_only mode, we don't need a specific month as it will be handled by the run-glicko command
+        # Set a default value to avoid the unbound variable error
+        PROCESS_MONTH="default"
+        log "PROCESS_MONTH not set for glicko_only mode, using default value"
+    else
+        # Default to previous month for other modes
+        PROCESS_MONTH=$(date -d "$(date +'%Y-%m-01') -1 month" +'%Y-%m')
+    fi
 fi
 
 log "Starting Chess Rating Pipeline"
@@ -75,21 +88,28 @@ log "Process Month: $PROCESS_MONTH"
 log "S3 Bucket: $S3_BUCKET"
 
 # Parse year and month from PROCESS_MONTH
-YEAR=$(echo "$PROCESS_MONTH" | cut -d'-' -f1)
-MONTH=$(echo "$PROCESS_MONTH" | cut -d'-' -f2)
-
-# Remove leading zero from month for arithmetic operations
-MONTH_NUM=$((10#$MONTH))
-
-# Check if this is a valid FIDE rating period
-if is_valid_rating_period "$YEAR" "$MONTH_NUM"; then
-    log "Month $PROCESS_MONTH is a valid FIDE rating period"
-    VALID_FIDE_PERIOD=true
-else
-    log "Month $PROCESS_MONTH is NOT a valid FIDE rating period"
-    log "FIDE data processing steps (1-6) will be skipped"
-    log "Glicko rating calculation (step 7) will still run"
+if [ "$PROCESS_MONTH" = "default" ] && [ "$PIPELINE_MODE" = "glicko_only" ]; then
+    # For glicko_only mode with default PROCESS_MONTH, skip FIDE period validation
+    # as the actual months will be handled by the run-glicko command
+    log "Skipping FIDE period validation for glicko_only mode with month range"
     VALID_FIDE_PERIOD=false
+else
+    YEAR=$(echo "$PROCESS_MONTH" | cut -d'-' -f1)
+    MONTH=$(echo "$PROCESS_MONTH" | cut -d'-' -f2)
+
+    # Remove leading zero from month for arithmetic operations
+    MONTH_NUM=$((10#$MONTH))
+
+    # Check if this is a valid FIDE rating period
+    if is_valid_rating_period "$YEAR" "$MONTH_NUM"; then
+        log "Month $PROCESS_MONTH is a valid FIDE rating period"
+        VALID_FIDE_PERIOD=true
+    else
+        log "Month $PROCESS_MONTH is NOT a valid FIDE rating period"
+        log "FIDE data processing steps (1-6) will be skipped"
+        log "Glicko rating calculation (step 7) will still run"
+        VALID_FIDE_PERIOD=false
+    fi
 fi
 
 # Validate required environment variables
