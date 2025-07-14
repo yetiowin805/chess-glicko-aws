@@ -213,11 +213,7 @@ impl RatingProcessor {
         let month: u32 = month_str[5..7].parse()
             .context("Invalid month format")?;
         
-        // Set up Rayon thread pool
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build_global()
-            .context("Failed to initialize thread pool")?;
+        // Thread pool initialization moved to main function
         
         Ok(Self {
             s3_client,
@@ -1109,6 +1105,12 @@ async fn main() -> Result<()> {
     
     info!("Processing {} month(s)", months_to_process.len());
     
+    // Set up Rayon thread pool
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(args.workers)
+        .build_global()
+        .context("Failed to initialize thread pool")?;
+
     // Process each month in sequence
     for (index, month_str) in months_to_process.iter().enumerate() {
         info!("Processing month {}/{}: {}", index + 1, months_to_process.len(), month_str);
