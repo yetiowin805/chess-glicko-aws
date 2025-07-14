@@ -753,8 +753,6 @@ impl RatingProcessor {
                 
                 let mut player_info = HashMap::new();
                 let mut total_records = 0;
-                let mut null_names = 0;
-                let mut null_birth_years = 0;
                 let mut empty_names = 0;
                 
                 let player_iter = stmt.query_map([], |row| {
@@ -763,10 +761,6 @@ impl RatingProcessor {
                     // Handle NULL birth_year gracefully
                     let birth_year_result: Result<u32, _> = row.get(4);
                     let birth_year = birth_year_result.ok(); // Convert error to None
-                    
-                    if birth_year.is_none() {
-                        null_birth_years += 1;
-                    }
                     
                     let name: String = row.get(1)?;
                     if name.is_empty() {
@@ -786,9 +780,6 @@ impl RatingProcessor {
                     let player = player_result.context("Failed to read player info row")?;
                     player_info.insert(player.id.clone(), player);
                 }
-                
-                info!("Player info database stats: {} total records, {} null birth years, {} empty names", 
-                      total_records, null_birth_years, empty_names);
                 
                 Ok(player_info)
             }
@@ -902,22 +893,6 @@ impl RatingProcessor {
         info!("Generating top lists from {} active players (RD <= 75.0) out of {} total players", 
               sorted_players.len(), players.len());
         
-        // Debug: Check top 10 players for missing info
-        info!("Top 10 players info lookup status:");
-        for (i, player) in sorted_players.iter().take(10).enumerate() {
-            let info = player_info.get(&player.id);
-            match info {
-                Some(info) => {
-                    info!("  {}. {} (rating: {:.0}) - Name: '{}', Fed: '{}', Sex: '{}', Birth: {:?}", 
-                          i + 1, player.id, player.rating, info.name, info.federation, info.sex, info.birth_year);
-                }
-                None => {
-                    warn!("  {}. {} (rating: {:.0}) - NO INFO FOUND in player database", 
-                          i + 1, player.id, player.rating);
-                }
-            }
-        }
-        
         // Capture year for use in closures
         let year = self.year;
         
@@ -982,6 +957,12 @@ impl RatingProcessor {
                         rd: player.rd,
                         player_id: player.id.clone(),
                     };
+                    
+                    // Log when we create an entry with missing player info
+                    if info.is_none() {
+                        warn!("Created top rating entry with missing info - rank: {}, player_id: \"{}\", rating: {:.6}, rd: {:.6}, name: \"\", federation: \"\", birth_year: null, sex: null", 
+                              rank, player.id, player.rating, player.rd);
+                    }
                     
                     top_players.push(entry);
                     
