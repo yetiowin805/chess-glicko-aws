@@ -8,7 +8,7 @@ log() {
 }
 
 # Check if we're being called with run-glicko arguments (for glicko_only mode with month ranges)
-if [ "$1" = "run-glicko" ] || [ "$1" = "/app/bin/run-glicko" ]; then
+if [ $# -gt 0 ] && ([ "$1" = "run-glicko" ] || [ "$1" = "/app/bin/run-glicko" ]); then
     log "Detected run-glicko command, executing directly..."
     exec "$@"
 fi
