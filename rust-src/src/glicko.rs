@@ -285,17 +285,6 @@ impl RatingProcessor {
     async fn process_time_control(&self, time_control: &str) -> Result<ProcessingStats> {
         info!("Processing time control: {}", time_control);
         
-        // Check if already processed
-        let parquet_s3_key = format!("persistent/ratings/{}/{}.parquet", self.month_str, time_control);
-        
-        if self.check_s3_file_exists(&parquet_s3_key).await? {
-            warn!("Already processed: {}", parquet_s3_key);
-            return Ok(ProcessingStats {
-                time_control: time_control.to_string(),
-                ..Default::default()
-            });
-        }
-        
         // Load current ratings from previous month
         let mut players = self.load_current_ratings(time_control).await?;
         info!("Loaded {} existing player ratings", players.len());
