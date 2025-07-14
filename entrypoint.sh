@@ -412,7 +412,7 @@ EOF
 - s3://$S3_BUCKET/persistent/player_info/raw/$PROCESS_MONTH.txt
 - s3://$S3_BUCKET/persistent/player_info/processed/$PROCESS_MONTH.txt
 - s3://$S3_BUCKET/persistent/tournament_data/processed/[time_control]/$PROCESS_MONTH/[tournament_id].txt
-- s3://$S3_BUCKET/persistent/active_players/$PROCESS_MONTH_[time_control].txt
+- s3://$S3_BUCKET/persistent/active_players/${PROCESS_MONTH}_[time_control].txt
 - s3://$S3_BUCKET/persistent/calculations/$PROCESS_MONTH/[time_control]/[player_id].json
 EOF
         fi
