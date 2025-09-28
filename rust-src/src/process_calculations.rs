@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use tokio::fs;
 use tracing::{error, info, warn};
 use regex::Regex;
-use rusqlite::{Connection};
+use rusqlite::{Connection, params};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 
@@ -119,12 +119,17 @@ struct ProcessingStats {
 struct PlayerMappings {
     exact_mappings: HashMap<String, String>,
     normalized_mappings: HashMap<String, String>,
+    // Mappings to integer IDs
+    name_to_int_id: HashMap<String, i64>,
+    string_id_to_int_id: HashMap<String, i64>,
 }
 
 // Tournament mapping cache
 struct TournamentMappings {
     tournament_to_month: HashMap<String, String>, // tournament_id -> target_month
     database_path: PathBuf, // Path to the tournament database file for fallback queries
+    // Mapping from tournament string ID to integer ID
+    tournament_id_to_int: HashMap<String, i64>,
 }
 
 // Multi-month processed data
@@ -315,12 +320,20 @@ impl CalculationProcessor {
         } else {
             if let Some(single_month_data) = processed_data.data_by_month.get(&self.month_str) {
                 if !single_month_data.is_empty() {
+                    // Save binary format
                     self.save_processed_calculations_binary(
                         single_month_data, 
                         time_control, 
                         time_control_index, 
                         &stats,
                         &self.month_str
+                    ).await?;
+                    
+                    // Save SQLite format
+                    self.save_processed_calculations_sqlite(
+                        single_month_data,
+                        time_control,
+                        &self.month_str,
                     ).await?;
                 }
             }
@@ -338,6 +351,7 @@ impl CalculationProcessor {
         info!("Loading tournament databases for {}", time_control);
         
         let mut tournament_to_month = HashMap::new();
+        let mut tournament_id_to_int = HashMap::new();
         let mut database_path = PathBuf::new();
         
         // Load tournament database for this time control
@@ -355,55 +369,64 @@ impl CalculationProcessor {
             let local_db_path = local_db_path.clone();
             let is_multi_month = self.is_multi_month;
             let month_str = self.month_str.clone();
-            move || -> Result<HashMap<String, String>> {
+            move || -> Result<(HashMap<String, String>, HashMap<String, i64>)> {
                 let conn = Connection::open(&local_db_path)
                     .context("Failed to open tournament database")?;
                 
-                let mut mappings = HashMap::new();
+                let mut month_mappings = HashMap::new();
+                let mut int_mappings = HashMap::new();
                 
                 if is_multi_month {
                     // Multi-month periods: tournament files have target_month field
-                    let mut stmt = conn.prepare("SELECT tournament_id, target_month FROM tournament_players")
+                    let mut stmt = conn.prepare("SELECT tournament_id, target_month, ROWID FROM tournament_players")
                         .context("Failed to prepare tournament query")?;
                     
                     let tournament_iter = stmt.query_map([], |row| {
                         Ok((
                             row.get::<_, String>(0)?, // tournament_id
                             row.get::<_, String>(1)?, // target_month
+                            row.get::<_, i64>(2)?,    // ROWID
                         ))
                     }).context("Failed to execute tournament query")?;
                     
                     for tournament_result in tournament_iter {
-                        let (tournament_id, target_month) = tournament_result
+                        let (tournament_id, target_month, int_id) = tournament_result
                             .context("Failed to read tournament row")?;
-                        mappings.insert(tournament_id, target_month);
+                        month_mappings.insert(tournament_id.clone(), target_month);
+                        int_mappings.insert(tournament_id, int_id);
                     }
                 } else {
                     // Single-month periods: all tournaments belong to the same month
-                    let mut stmt = conn.prepare("SELECT DISTINCT tournament_id FROM tournament_players")
+                    let mut stmt = conn.prepare("SELECT DISTINCT tournament_id, ROWID FROM tournament_players")
                         .context("Failed to prepare tournament query")?;
                     
                     let tournament_iter = stmt.query_map([], |row| {
-                        Ok(row.get::<_, String>(0)?) // tournament_id
+                        Ok((
+                            row.get::<_, String>(0)?, // tournament_id
+                            row.get::<_, i64>(1)?,    // ROWID
+                        ))
                     }).context("Failed to execute tournament query")?;
                     
                     for tournament_result in tournament_iter {
-                        let tournament_id = tournament_result
+                        let (tournament_id, int_id) = tournament_result
                             .context("Failed to read tournament row")?;
-                        mappings.insert(tournament_id, month_str.clone());
+                        month_mappings.insert(tournament_id.clone(), month_str.clone());
+                        int_mappings.insert(tournament_id, int_id);
                     }
                 }
                 
-                info!("Loaded {} tournament mappings", mappings.len());
-                Ok(mappings)
+                info!("Loaded {} tournament mappings", month_mappings.len());
+                Ok((month_mappings, int_mappings))
             }
         }).await??;
         
-        tournament_to_month.extend(mappings);
+        tournament_to_month.extend(mappings.0);
+        tournament_id_to_int.extend(mappings.1);
         
         Ok(TournamentMappings {
             tournament_to_month,
             database_path,
+            tournament_id_to_int,
         })
     }
 
@@ -443,22 +466,27 @@ impl CalculationProcessor {
                 
                 let mut exact_mappings = HashMap::new();
                 let mut normalized_mappings = HashMap::new();
+                let mut name_to_int_id = HashMap::new();
+                let mut string_id_to_int_id = HashMap::new();
                 
-                let mut stmt = conn.prepare("SELECT id, name FROM players")
+                let mut stmt = conn.prepare("SELECT id, name, ROWID FROM players")
                     .context("Failed to prepare player query")?;
                 
                 let player_iter = stmt.query_map([], |row| {
                     Ok((
-                        row.get::<_, String>(0)?, // id
+                        row.get::<_, String>(0)?, // id (string)
                         row.get::<_, String>(1)?, // name
+                        row.get::<_, i64>(2)?,    // ROWID (integer)
                     ))
                 }).context("Failed to execute player query")?;
                 
                 for player_result in player_iter {
-                    let (player_id, name) = player_result
+                    let (player_id, name, int_id) = player_result
                         .context("Failed to read player row")?;
                     
                     exact_mappings.insert(name.to_lowercase(), player_id.clone());
+                    name_to_int_id.insert(name.to_lowercase(), int_id);
+                    string_id_to_int_id.insert(player_id.clone(), int_id);
                     
                     let normalized = normalize_player_name(&name);
                     if !normalized.is_empty() {
@@ -472,6 +500,8 @@ impl CalculationProcessor {
                 Ok(PlayerMappings {
                     exact_mappings,
                     normalized_mappings,
+                    name_to_int_id,
+                    string_id_to_int_id,
                 })
             }
         }).await??;
@@ -561,10 +591,24 @@ impl CalculationProcessor {
         for month in &self.period_months {
             games_by_month.insert(month.clone(), Vec::new());
         }
+
+        // Get player integer ID
+        let player_id_int = player_mappings.string_id_to_int_id
+            .get(&player_record.player_id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Player ID {} not found in integer mappings", player_record.player_id))?;
         
         for tournament in &player_record.calculation_data.tournaments {
             let tournament_id_hash = self.hash_string(&tournament.tournament_id);
             let is_unrated = tournament.player_is_unrated.unwrap_or(false);
+            
+            // Get tournament integer ID
+            let tournament_id_int = tournament_mappings
+                .and_then(|tm| tm.tournament_id_to_int.get(&tournament.tournament_id).copied())
+                .unwrap_or_else(|| {
+                    warn!("Tournament {} not found in integer mappings, using hash as fallback", tournament.tournament_id);
+                    tournament_id_hash as i64
+                });
             
             // Determine target month for this tournament
             let target_month = if let Some(mappings) = tournament_mappings {
@@ -594,6 +638,15 @@ impl CalculationProcessor {
                 
                 let score = self.convert_result_to_score(&game.result)?;
                 let mut opponent_id = self.get_player_id_from_name(opponent_name, player_mappings);
+                let mut opponent_id_int: Option<i64> = None;
+                
+                // Get opponent integer ID
+                if let Some(ref opp_id) = opponent_id {
+                    opponent_id_int = player_mappings.string_id_to_int_id.get(opp_id).copied();
+                } else {
+                    // Try to get integer ID directly from name
+                    opponent_id_int = player_mappings.name_to_int_id.get(&opponent_name.to_lowercase()).copied();
+                }
                 
                 // Fallback: try to find opponent in tournament data if not found in player mappings
                 if opponent_id.is_none() {
@@ -603,6 +656,10 @@ impl CalculationProcessor {
                             &tournament.tournament_id, 
                             mappings
                         ).await;
+                        
+                        if let Some(ref opp_id) = opponent_id {
+                            opponent_id_int = player_mappings.string_id_to_int_id.get(opp_id).copied();
+                        }
                     }
                 }
                 
@@ -614,6 +671,11 @@ impl CalculationProcessor {
                         continue;
                     }
                 };
+
+                let opponent_id_int = opponent_id_int.unwrap_or_else(|| {
+                    warn!("Could not resolve opponent integer ID for '{}', using hash as fallback", opponent_name);
+                    opponent_id_hash as i64
+                });
                 
                 let opponent_rating = game.opponent_rating
                     .as_ref()
@@ -630,6 +692,8 @@ impl CalculationProcessor {
                     opponent_id_hash,
                     opponent_rating,
                     result_and_flags,
+                    tournament_id_int,
+                    opponent_id_int,
                 };
                 
                 if let Some(month_games) = games_by_month.get_mut(&target_month) {
@@ -646,6 +710,7 @@ impl CalculationProcessor {
             } else {
                 result.insert(month, Some(ProcessedPlayer {
                     player_id: player_record.player_id.clone(),
+                    player_id_int,
                     games,
                 }));
             }
@@ -670,12 +735,20 @@ impl CalculationProcessor {
                     total_games: players.iter().map(|p| p.games.len() as u64).sum(),
                 };
                 
+                // Save binary format
                 self.save_processed_calculations_binary(
                     players, 
                     time_control, 
                     time_control_index, 
                     &month_stats,
                     month
+                ).await?;
+                
+                // Save SQLite format
+                self.save_processed_calculations_sqlite(
+                    players,
+                    time_control,
+                    month,
                 ).await?;
             }
         }
@@ -863,6 +936,100 @@ impl CalculationProcessor {
         Ok(())
     }
 
+    async fn save_processed_calculations_sqlite(
+        &self,
+        processed_data: &[ProcessedPlayer],
+        time_control: &str,
+        target_month: &str,
+    ) -> Result<()> {
+        let output_filename = format!("{}_{}.db", target_month, time_control);
+        let local_file = self.temp_dir.join(&output_filename);
+        
+        // Create SQLite database
+        let result = tokio::task::spawn_blocking({
+            let local_file = local_file.clone();
+            let processed_data = processed_data.to_vec();
+            move || -> Result<()> {
+                let conn = Connection::open(&local_file)?;
+                
+                // Create table and indexes
+                conn.execute(
+                    "CREATE TABLE games (
+                        player_id     INTEGER NOT NULL,
+                        opponent_id   INTEGER NOT NULL,
+                        result        INTEGER NOT NULL,
+                        unrated       INTEGER NOT NULL,
+                        tournament_id INTEGER NOT NULL
+                    )",
+                    [],
+                )?;
+                
+                conn.execute("CREATE INDEX idx_player ON games(player_id)", [])?;
+                conn.execute("CREATE INDEX idx_opponent ON games(opponent_id)", [])?;
+                conn.execute("CREATE INDEX idx_tournament ON games(tournament_id)", [])?;
+                
+                // Prepare insert statement
+                let mut stmt = conn.prepare(
+                    "INSERT INTO games (player_id, opponent_id, result, unrated, tournament_id) 
+                     VALUES (?1, ?2, ?3, ?4, ?5)"
+                )?;
+                
+                // Insert data in batches within a transaction
+                const BATCH_SIZE: usize = 1000;
+                let mut batch_count = 0;
+                
+                let tx = conn.unchecked_transaction()?;
+                
+                for player in &processed_data {
+                    for game in &player.games {
+                        let result = (game.result_and_flags & 0b011) as i64; // Extract result bits
+                        let unrated = if (game.result_and_flags & 0b100) != 0 { 1 } else { 0 }; // Extract unrated flag
+                        
+                        stmt.execute(params![
+                            player.player_id_int,
+                            game.opponent_id_int,
+                            result,
+                            unrated,
+                            game.tournament_id_int,
+                        ])?;
+                        
+                        batch_count += 1;
+                        if batch_count >= BATCH_SIZE {
+                            // Commit current batch and start new transaction
+                            tx.commit()?;
+                            let tx = conn.unchecked_transaction()?;
+                            batch_count = 0;
+                        }
+                    }
+                }
+                
+                // Commit final batch
+                if batch_count > 0 {
+                    tx.commit()?;
+                }
+                
+                Ok(())
+            }
+        }).await??;
+        
+        // Compress and upload to S3
+        let compressed_file = self.temp_dir.join(format!("{}.gz", output_filename));
+        self.compress_file(&local_file, &compressed_file).await?;
+        
+        let s3_key = format!("persistent/calculations_processed/{}.gz", output_filename);
+        self.upload_file(&compressed_file, &s3_key).await?;
+        
+        // Clean up
+        fs::remove_file(&local_file).await?;
+        fs::remove_file(&compressed_file).await?;
+        
+        info!("Saved SQLite database for {} games to {} for month {}", 
+              processed_data.iter().map(|p| p.games.len()).sum::<usize>(), 
+              s3_key, target_month);
+        
+        Ok(())
+    }
+
     fn get_output_filename(&self, time_control: &str, target_month: &str) -> String {
         format!("{}_{}.bin", target_month, time_control)
     }
@@ -953,6 +1120,7 @@ impl CalculationProcessor {
 #[derive(Debug)]
 struct ProcessedPlayer {
     player_id: String,
+    player_id_int: i64,  // Integer ID for SQLite
     games: Vec<ProcessedGame>,
 }
 
@@ -962,6 +1130,9 @@ struct ProcessedGame {
     opponent_id_hash: u64,
     opponent_rating: u16,
     result_and_flags: u8,
+    // Fields for SQLite
+    tournament_id_int: i64,
+    opponent_id_int: i64,
 }
 
 #[tokio::main]
