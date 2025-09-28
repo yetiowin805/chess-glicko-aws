@@ -942,93 +942,99 @@ impl CalculationProcessor {
         time_control: &str,
         target_month: &str,
     ) -> Result<()> {
+        use rusqlite::params;
+    
         let output_filename = format!("{}_{}.db", target_month, time_control);
         let local_file = self.temp_dir.join(&output_filename);
-        
-        // Create SQLite database
-        let result = tokio::task::spawn_blocking({
+    
+        // Do all SQLite work in a blocking thread.
+        tokio::task::spawn_blocking({
+            // Prepack the data we need into plain values the blocking thread can own.
+            // (Avoids capturing &self etc.)
             let local_file = local_file.clone();
-            let processed_data = processed_data.to_vec();
+    
+            // Flatten the vector so we don't borrow across the thread boundary.
+            // For each player: (player_id_int, Vec<(opponent_id_int, result_i64, unrated_i64, tournament_id_int)>)
+            let packed: Vec<(i64, Vec<(i64, i64, i64, i64)>)> = processed_data
+                .iter()
+                .map(|p| {
+                    let rows: Vec<(i64, i64, i64, i64)> = p
+                        .games
+                        .iter()
+                        .map(|g| {
+                            let result_i64 = (g.result_and_flags & 0b011) as i64; // 0/1/2
+                            let unrated_i64 = if (g.result_and_flags & 0b100) != 0 { 1 } else { 0 };
+                            (g.opponent_id_int, result_i64, unrated_i64, g.tournament_id_int)
+                        })
+                        .collect();
+                    (p.player_id_int, rows)
+                })
+                .collect();
+    
             move || -> Result<()> {
-                let conn = Connection::open(&local_file)?;
-                
-                // Create table and indexes
+                let mut conn = Connection::open(&local_file)?;
+                // Sensible pragmas for bulk insert speed
+                conn.execute_batch(
+                    r#"
+                    PRAGMA journal_mode=WAL;
+                    PRAGMA synchronous=NORMAL;
+                    PRAGMA temp_store=MEMORY;
+                    "#,
+                )?;
+    
                 conn.execute(
-                    "CREATE TABLE games (
+                    "CREATE TABLE IF NOT EXISTS games (
                         player_id     INTEGER NOT NULL,
                         opponent_id   INTEGER NOT NULL,
-                        result        INTEGER NOT NULL,
-                        unrated       INTEGER NOT NULL,
+                        result        INTEGER NOT NULL,   -- 0=loss,1=draw,2=win (from player perspective)
+                        unrated       INTEGER NOT NULL,   -- 0/1 flag from tournament
                         tournament_id INTEGER NOT NULL
                     )",
                     [],
                 )?;
-                
-                conn.execute("CREATE INDEX idx_player ON games(player_id)", [])?;
-                conn.execute("CREATE INDEX idx_opponent ON games(opponent_id)", [])?;
-                conn.execute("CREATE INDEX idx_tournament ON games(tournament_id)", [])?;
-                
-                // Prepare insert statement
-                let mut stmt = conn.prepare(
-                    "INSERT INTO games (player_id, opponent_id, result, unrated, tournament_id) 
-                     VALUES (?1, ?2, ?3, ?4, ?5)"
-                )?;
-                
-                // Insert data in batches within a transaction
-                const BATCH_SIZE: usize = 1000;
-                let mut batch_count = 0;
-                
-                let tx = conn.unchecked_transaction()?;
-                
-                for player in &processed_data {
-                    for game in &player.games {
-                        let result = (game.result_and_flags & 0b011) as i64; // Extract result bits
-                        let unrated = if (game.result_and_flags & 0b100) != 0 { 1 } else { 0 }; // Extract unrated flag
-                        
-                        stmt.execute(params![
-                            player.player_id_int,
-                            game.opponent_id_int,
-                            result,
-                            unrated,
-                            game.tournament_id_int,
-                        ])?;
-                        
-                        batch_count += 1;
-                        if batch_count >= BATCH_SIZE {
-                            // Commit current batch and start new transaction
-                            tx.commit()?;
-                            let tx = conn.unchecked_transaction()?;
-                            batch_count = 0;
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_player     ON games(player_id)", [])?;
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_opponent   ON games(opponent_id)", [])?;
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_tournament ON games(tournament_id)", [])?;
+    
+                let tx = conn.transaction()?;
+                {
+                    let mut stmt = tx.prepare(
+                        "INSERT INTO games (player_id, opponent_id, result, unrated, tournament_id)
+                        VALUES (?1, ?2, ?3, ?4, ?5)",
+                    )?;
+        
+                    for (player_id, rows) in &packed {
+                        for (opp_id, result_i64, unrated_i64, tourn_i64) in rows {
+                            stmt.execute(params![player_id, opp_id, result_i64, unrated_i64, tourn_i64])?;
                         }
                     }
                 }
-                
-                // Commit final batch
-                if batch_count > 0 {
-                    tx.commit()?;
-                }
-                
+    
+                tx.commit()?;
                 Ok(())
             }
         }).await??;
-        
-        // Compress and upload to S3
+    
+        // Compress and upload the SQLite file
         let compressed_file = self.temp_dir.join(format!("{}.gz", output_filename));
         self.compress_file(&local_file, &compressed_file).await?;
-        
+    
         let s3_key = format!("persistent/calculations_processed/{}.gz", output_filename);
         self.upload_file(&compressed_file, &s3_key).await?;
-        
+    
         // Clean up
         fs::remove_file(&local_file).await?;
         fs::remove_file(&compressed_file).await?;
-        
-        info!("Saved SQLite database for {} games to {} for month {}", 
-              processed_data.iter().map(|p| p.games.len()).sum::<usize>(), 
-              s3_key, target_month);
-        
+    
+        info!(
+            "Saved SQLite database for {} games to {} for month {}",
+            processed_data.iter().map(|p| p.games.len()).sum::<usize>(),
+            s3_key,
+            target_month
+        );
+    
         Ok(())
-    }
+    }    
 
     fn get_output_filename(&self, time_control: &str, target_month: &str) -> String {
         format!("{}_{}.bin", target_month, time_control)
