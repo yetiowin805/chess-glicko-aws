@@ -159,8 +159,8 @@ jobs:
         S3_BUCKET_NAME: ${{ steps.infra.outputs.s3_bucket_name }}
         SUBNET_IDS: ${{ steps.infra.outputs.subnet_ids }}
         SECURITY_GROUP_ID: ${{ steps.infra.outputs.security_group_id }}
-        MONTHS: ${{ steps.months.outputs.months }}
-        MONTH_COUNT: ${{ steps.months.outputs.month_count }}
+        MONTHS: ${{ steps.months.outputs.MONTHS }}          # <-- fixed casing
+        MONTH_COUNT: ${{ steps.months.outputs.MONTH_COUNT }} # <-- fixed casing
       run: |
         # --- Logging Helpers ---
         NC='\033[0m'
@@ -192,7 +192,7 @@ jobs:
               --task-definition $TASK_DEFINITION \
               --launch-type FARGATE \
               --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],assignPublicIp=ENABLED,securityGroups=[$SECURITY_GROUP_ID]}" \
-              --overrides "{\"containerOverrides\":[{\"name\":\"chess-glicko\",\"command\":[\"run-glicko\",\"--first-month\",\"${{ github.event.inputs.first_month }}\",\"--last-month\",\"${{ github.event.inputs.last_month }}\"],\"environment\":[{\"name\":\"S3_BUCKET\",\"value\":\"$S3_BUCKET_NAME\"}]}],\"cpu\":\"${{ github.event.inputs.task_cpu }}\",\"memory\":\"${{ github.event.inputs.task_memory }}\"}" \
+              --overrides "{\"containerOverrides\":[{\"name\":\"chess-glicko\",\"command\":[\"run-glicko\",\"--first-month\",\"${{ github.event.inputs.first_month }}\",\"--last-month\",\"${{ github.event.inputs.last_month }}\"],\"environment\":[{\"name\":\"S3_BUCKET\",\"value\":\"$S3_BUCKET_NAME\"},{\"name\":\"PIPELINE_MODE\",\"value\":\"glicko_only\"},{\"name\":\"AWS_REGION\",\"value\":\"${AWS_REGION}\"}]}],\"cpu\":\"${{ github.event.inputs.task_cpu }}\",\"memory\":\"${{ github.event.inputs.task_memory }}\"}" \
               --query 'tasks[0].taskArn' --output text)
               
             if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
@@ -240,7 +240,7 @@ jobs:
                   --task-definition $TASK_DEFINITION \
                   --launch-type FARGATE \
                   --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],assignPublicIp=ENABLED,securityGroups=[$SECURITY_GROUP_ID]}" \
-                  --overrides "{\"containerOverrides\":[{\"name\":\"chess-glicko\",\"environment\":[{\"name\":\"PROCESS_MONTH\",\"value\":\"$MONTH\"},{\"name\":\"PIPELINE_MODE\",\"value\":\"${{ github.event.inputs.pipeline_mode }}\"},{\"name\":\"S3_BUCKET\",\"value\":\"$S3_BUCKET_NAME\"}]}],\"cpu\":\"${{ github.event.inputs.task_cpu }}\",\"memory\":\"${{ github.event.inputs.task_memory }}\"}" \
+                  --overrides "{\"containerOverrides\":[{\"name\":\"chess-glicko\",\"environment\":[{\"name\":\"PROCESS_MONTH\",\"value\":\"$MONTH\"},{\"name\":\"PIPELINE_MODE\",\"value\":\"${{ github.event.inputs.pipeline_mode }}\"},{\"name\":\"S3_BUCKET\",\"value\":\"$S3_BUCKET_NAME\"},{\"name\":\"AWS_REGION\",\"value\":\"${AWS_REGION}\"}]}],\"cpu\":\"${{ github.event.inputs.task_cpu }}\",\"memory\":\"${{ github.event.inputs.task_memory }}\"}" \
                   --query 'tasks[0].taskArn' --output text)
 
                 if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
