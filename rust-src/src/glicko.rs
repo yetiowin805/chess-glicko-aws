@@ -345,11 +345,8 @@ impl RatingProcessor {
         let reader = builder.build()
             .context("Failed to build Parquet reader")?;
         
-        let mut total_rows = 0;
-        
         for batch_result in reader {
             let batch = batch_result.context("Failed to read batch from Parquet file")?;
-            total_rows += batch.num_rows();
             
             let player_ids = batch.column(0).as_any().downcast_ref::<StringArray>()
                 .context("Failed to read player_id column")?;
@@ -467,7 +464,7 @@ impl RatingProcessor {
         let mut opponents_found = 0u64;
         
         // Read player data
-        for player_idx in 0..player_count {
+        for _player_idx in 0..player_count {
             // Read player header
             let mut player_header_bytes = [0u8; std::mem::size_of::<PlayerHeader>()];
             reader.read_exact(&mut player_header_bytes)
@@ -549,7 +546,7 @@ impl RatingProcessor {
             // Log sample game for debugging
             if !player.games.is_empty() {
                 let first_game = &player.games[0];
-                let result_str = match first_game.score {
+                let _result_str = match first_game.score {
                     0.0 => "Loss",
                     0.5 => "Draw", 
                     1.0 => "Win",

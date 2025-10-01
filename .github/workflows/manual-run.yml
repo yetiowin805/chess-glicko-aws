@@ -131,7 +131,7 @@ jobs:
           --output text | cut -d'/' -f2)
         
         if [ -z "$CLUSTER_NAME" ]; then
-          echo "⚠️  No cluster found with project name, using default: chess-glicko-cluster"
+          echo "WARNING: No cluster found with project name, using default: chess-glicko-cluster"
           CLUSTER_NAME="chess-glicko-cluster"
         fi
         echo "cluster_name=$CLUSTER_NAME" >> $GITHUB_OUTPUT
@@ -146,7 +146,7 @@ jobs:
           --output text | cut -d'/' -f2 | cut -d':' -f1)
         
         if [ -z "$TASK_DEF" ] || [ "$TASK_DEF" = "None" ]; then
-          echo "⚠️  No task definition found with project name, using default: chess-glicko-task"
+          echo "WARNING: No task definition found with project name, using default: chess-glicko-task"
           TASK_DEF="chess-glicko-task"
         fi
         echo "task_definition=$TASK_DEF" >> $GITHUB_OUTPUT
@@ -177,7 +177,7 @@ jobs:
             --filters "Name=group-name,Values=default" \
             --query 'SecurityGroups[0].GroupId' \
             --output text)
-          echo "⚠️  Using default security group: $SG_ID"
+          echo "WARNING: Using default security group: $SG_ID"
         else
           echo "Using project security group: $SG_ID"
         fi
@@ -210,43 +210,45 @@ jobs:
         # Store pipeline start time for monitoring
         PIPELINE_START_TIME=$(date -u +%Y-%m-%dT%H:%M:%S)
         echo "pipeline_start_time=$PIPELINE_START_TIME" >> $GITHUB_OUTPUT
+        echo "Pipeline start time: $PIPELINE_START_TIME"
         
         # Prepare pipeline mode description
         if [ "${{ github.event.inputs.pipeline_mode }}" = "full" ]; then
-          echo "📊 Full pipeline will run all steps for each month:"
+          echo "Full pipeline will run all steps for each month:"
           echo "  - Download data archives"
           echo "  - Extract and process games"
           echo "  - Calculate Glicko ratings"
           echo "  - Upload results to S3"
           ESTIMATED_TIME_PER_MONTH=17
-          echo "  ⚠️  Expected duration per month: 15-20 minutes"
+          echo "  Expected duration per month: 15-20 minutes"
         elif [ "${{ github.event.inputs.pipeline_mode }}" = "post_scraping" ]; then
-          echo "📊 Post-scraping pipeline will run for each month:"
+          echo "Post-scraping pipeline will run for each month:"
           echo "  - Process calculation data"
           echo "  - Calculate Glicko ratings"
           echo "  - Upload results to S3"
           ESTIMATED_TIME_PER_MONTH=3
-          echo "  ⚠️  Expected duration per month: 2-5 minutes"
+          echo "  Expected duration per month: 2-5 minutes"
         else
-          echo "📊 Glicko-only pipeline will run for all months in a single task:"
+          echo "Glicko-only pipeline will run for all months in a single task:"
           echo "  - Calculate Glicko ratings only"
           echo "  - Upload rating results to S3"
           ESTIMATED_TIME_PER_MONTH=1
-          echo "  ⚠️  Expected duration per month: 1-2 minutes"
+          echo "  Expected duration per month: 1-2 minutes"
         fi
         
         TOTAL_ESTIMATED_TIME=$((ESTIMATED_TIME_PER_MONTH * MONTH_COUNT))
-        echo "  🕐 Total estimated time: ~$TOTAL_ESTIMATED_TIME minutes"
+        echo "  Total estimated time: ~$TOTAL_ESTIMATED_TIME minutes"
         echo ""
         
         # Check if we should use single task for glicko_only mode
         if [ "${{ github.event.inputs.pipeline_mode }}" = "glicko_only" ]; then
-          echo "🚀 Using optimized single-task approach for glicko_only mode"
+          echo "Using optimized single-task approach for glicko_only mode"
           echo "=================================="
-          echo "🗓️  Processing all months in single task: ${{ github.event.inputs.first_month }} to ${{ github.event.inputs.last_month }}"
+          echo "Processing all months in single task: ${{ github.event.inputs.first_month }} to ${{ github.event.inputs.last_month }}"
           echo "=================================="
           
           # Create single task with month range
+          echo "DEBUG: Starting ECS task..."
           TASK_ARN=$(aws ecs run-task \
             --cluster $CLUSTER_NAME \
             --task-definition $TASK_DEFINITION \
@@ -278,46 +280,60 @@ jobs:
             --output text)
           
           if [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
-            echo "✅ Single glicko task started successfully!"
+            echo "Single glicko task started successfully!"
             echo "Task ARN: $TASK_ARN"
+            echo "CloudWatch Logs: https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/%2Fecs%2F${{ env.PROJECT_NAME }}"
             
             # Store task ARN for monitoring
             echo "task_arns=$TASK_ARN" >> $GITHUB_OUTPUT
             
             # Wait for task to complete - increased timeout for multiple months
-            echo "⏳ Waiting for task to complete..."
+            echo "Waiting for task to complete (polling every 30 seconds)..."
             TASK_STATUS="RUNNING"
             MAX_WAIT_TIME=$((TOTAL_ESTIMATED_TIME * 60 + 600))  # Estimated time + 10 minutes buffer
             WAIT_TIME=0
+            CHECK_COUNT=0
             
             while [[ "$TASK_STATUS" != "STOPPED" && $WAIT_TIME -lt $MAX_WAIT_TIME ]]; do
               sleep 30
               WAIT_TIME=$((WAIT_TIME + 30))
+              CHECK_COUNT=$((CHECK_COUNT + 1))
+              
+              echo "DEBUG: Status check #$CHECK_COUNT (elapsed: $((WAIT_TIME / 60))m ${((WAIT_TIME % 60))}s)"
               TASK_STATUS=$(aws ecs describe-tasks \
                 --cluster "$CLUSTER_NAME" \
                 --tasks "$TASK_ARN" \
                 --query 'tasks[0].lastStatus' \
                 --output text 2>/dev/null || echo "UNKNOWN")
+              echo "DEBUG: Task status = '$TASK_STATUS'"
               
-              if [[ $((WAIT_TIME % 300)) -eq 0 ]]; then  # Log every 5 minutes
-                echo "⏳ Task still running after $((WAIT_TIME / 60)) minutes... (Status: $TASK_STATUS)"
+              if [[ "$TASK_STATUS" = "UNKNOWN" ]]; then
+                echo "WARNING: Failed to query task status, will retry..."
+              fi
+              
+              if [[ $((WAIT_TIME % 300)) -eq 0 ]]; then
+                echo "Task still running after $((WAIT_TIME / 60)) minutes (Status: $TASK_STATUS)"
               fi
             done
             
+            echo "DEBUG: Exited wait loop - Status: $TASK_STATUS, Wait time: ${WAIT_TIME}s"
+            
             # Check final status
             if [[ "$TASK_STATUS" = "STOPPED" ]]; then
+              echo "Task has stopped, checking exit code..."
               EXIT_CODE=$(aws ecs describe-tasks \
                 --cluster "$CLUSTER_NAME" \
                 --tasks "$TASK_ARN" \
                 --query 'tasks[0].containers[0].exitCode' \
                 --output text 2>/dev/null || echo "unknown")
+              echo "DEBUG: Exit code = '$EXIT_CODE'"
               
               if [[ "$EXIT_CODE" = "0" ]]; then
-                echo "✅ Glicko task completed successfully for all months!"
+                echo "Glicko task completed successfully for all months!"
                 echo "successful_months=$MONTHS" >> $GITHUB_OUTPUT
                 echo "failed_months=" >> $GITHUB_OUTPUT
               else
-                echo "❌ Glicko task failed (Exit code: $EXIT_CODE)"
+                echo "Glicko task failed (Exit code: $EXIT_CODE)"
                 STOP_REASON=$(aws ecs describe-tasks \
                   --cluster "$CLUSTER_NAME" \
                   --tasks "$TASK_ARN" \
@@ -329,22 +345,23 @@ jobs:
                 exit 1
               fi
             else
-              echo "❌ Glicko task timed out (waited $((WAIT_TIME / 60)) minutes)"
+              echo "Glicko task timed out or failed to complete (waited $((WAIT_TIME / 60)) minutes)"
+              echo "Last known status: $TASK_STATUS"
               echo "successful_months=" >> $GITHUB_OUTPUT
               echo "failed_months=$MONTHS" >> $GITHUB_OUTPUT
               exit 1
             fi
           else
-            echo "❌ Failed to start glicko task"
-            echo "Task ARN: '$TASK_ARN'"
+            echo "Failed to start glicko task"
+            echo "Task ARN returned: '$TASK_ARN'"
             echo "successful_months=" >> $GITHUB_OUTPUT
             echo "failed_months=$MONTHS" >> $GITHUB_OUTPUT
             exit 1
           fi
           
-          echo "🎉 Single-task glicko processing completed successfully!"
+          echo "Single-task glicko processing completed successfully!"
         else
-          echo "🔄 Using traditional per-month approach for ${{ github.event.inputs.pipeline_mode }} mode"
+          echo "Using traditional per-month approach for ${{ github.event.inputs.pipeline_mode }} mode"
           
           # Track results
           SUCCESSFUL_MONTHS=""
@@ -355,11 +372,12 @@ jobs:
           # Process each month
           for MONTH in $MONTHS; do
             echo "=================================="
-            echo "🗓️  Processing month $CURRENT_MONTH_NUM of $MONTH_COUNT: $MONTH"
+            echo "Processing month $CURRENT_MONTH_NUM of $MONTH_COUNT: $MONTH"
             echo "=================================="
             
             # Run the task
             echo "Starting pipeline task for $MONTH..."
+            echo "DEBUG: Running aws ecs run-task..."
             TASK_ARN=$(aws ecs run-task \
               --cluster $CLUSTER_NAME \
               --task-definition $TASK_DEFINITION \
@@ -386,46 +404,61 @@ jobs:
               --query 'tasks[0].taskArn' \
               --output text)
             
+            echo "DEBUG: Returned task ARN: '$TASK_ARN'"
+            
             if [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
-              echo "✅ Pipeline task started successfully for $MONTH!"
+              echo "Pipeline task started successfully for $MONTH!"
               echo "Task ARN: $TASK_ARN"
+              echo "CloudWatch Logs: https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/%2Fecs%2F${{ env.PROJECT_NAME }}"
               
               # Store task ARN for monitoring
               ALL_TASK_ARNS="$ALL_TASK_ARNS $TASK_ARN"
               
-              # Wait for task to complete - increased to 1 hour (3600 seconds)
-              echo "⏳ Waiting for task to complete..."
+              # Wait for task to complete - 1 hour max
+              echo "Waiting for task to complete (polling every 30 seconds)..."
               TASK_STATUS="RUNNING"
               MAX_WAIT_TIME=3600  # 1 hour max wait
               WAIT_TIME=0
+              CHECK_COUNT=0
               
               while [[ "$TASK_STATUS" != "STOPPED" && $WAIT_TIME -lt $MAX_WAIT_TIME ]]; do
                 sleep 30
                 WAIT_TIME=$((WAIT_TIME + 30))
+                CHECK_COUNT=$((CHECK_COUNT + 1))
+                
                 TASK_STATUS=$(aws ecs describe-tasks \
                   --cluster "$CLUSTER_NAME" \
                   --tasks "$TASK_ARN" \
                   --query 'tasks[0].lastStatus' \
                   --output text 2>/dev/null || echo "UNKNOWN")
                 
-                if [[ $((WAIT_TIME % 300)) -eq 0 ]]; then  # Log every 5 minutes
-                  echo "⏳ Task still running after $((WAIT_TIME / 60)) minutes... (Status: $TASK_STATUS)"
+                # Log every 30 seconds for first 5 minutes, then every 5 minutes
+                if [[ $WAIT_TIME -le 300 ]] || [[ $((WAIT_TIME % 300)) -eq 0 ]]; then
+                  echo "[Check #$CHECK_COUNT @ $((WAIT_TIME / 60))m ${((WAIT_TIME % 60))}s] Status: $TASK_STATUS"
+                fi
+                
+                if [[ "$TASK_STATUS" = "UNKNOWN" ]]; then
+                  echo "WARNING: Failed to query task status, will retry..."
                 fi
               done
               
+              echo "DEBUG: Exited wait loop - Status: $TASK_STATUS, Wait time: ${WAIT_TIME}s"
+              
               # Check final status
               if [[ "$TASK_STATUS" = "STOPPED" ]]; then
+                echo "Task has stopped, checking exit code..."
                 EXIT_CODE=$(aws ecs describe-tasks \
                   --cluster "$CLUSTER_NAME" \
                   --tasks "$TASK_ARN" \
                   --query 'tasks[0].containers[0].exitCode' \
                   --output text 2>/dev/null || echo "unknown")
+                echo "DEBUG: Exit code = '$EXIT_CODE'"
                 
                 if [[ "$EXIT_CODE" = "0" ]]; then
-                  echo "✅ Task completed successfully for $MONTH!"
+                  echo "Task completed successfully for $MONTH!"
                   SUCCESSFUL_MONTHS="$SUCCESSFUL_MONTHS $MONTH"
                 else
-                  echo "❌ Task failed for $MONTH (Exit code: $EXIT_CODE)"
+                  echo "Task failed for $MONTH (Exit code: $EXIT_CODE)"
                   STOP_REASON=$(aws ecs describe-tasks \
                     --cluster "$CLUSTER_NAME" \
                     --tasks "$TASK_ARN" \
@@ -435,12 +468,13 @@ jobs:
                   FAILED_MONTHS="$FAILED_MONTHS $MONTH"
                 fi
               else
-                echo "❌ Task timed out for $MONTH (waited $((WAIT_TIME / 60)) minutes)"
+                echo "Task timed out for $MONTH (waited $((WAIT_TIME / 60)) minutes)"
+                echo "Last known status: $TASK_STATUS"
                 FAILED_MONTHS="$FAILED_MONTHS $MONTH"
               fi
             else
-              echo "❌ Failed to start pipeline task for $MONTH"
-              echo "Task ARN: '$TASK_ARN'"
+              echo "Failed to start pipeline task for $MONTH"
+              echo "Task ARN returned: '$TASK_ARN'"
               FAILED_MONTHS="$FAILED_MONTHS $MONTH"
             fi
             
@@ -454,24 +488,23 @@ jobs:
           echo "failed_months=$FAILED_MONTHS" >> $GITHUB_OUTPUT
           
           echo "=================================="
-          echo "📊 FINAL RESULTS"
+          echo "FINAL RESULTS"
           echo "=================================="
           echo "Total months processed: $MONTH_COUNT"
           
           if [[ -n "$SUCCESSFUL_MONTHS" ]]; then
             SUCCESSFUL_COUNT=$(echo $SUCCESSFUL_MONTHS | wc -w)
-            echo "✅ Successful months ($SUCCESSFUL_COUNT):$SUCCESSFUL_MONTHS"
+            echo "Successful months ($SUCCESSFUL_COUNT):$SUCCESSFUL_MONTHS"
           fi
           
           if [[ -n "$FAILED_MONTHS" ]]; then
             FAILED_COUNT=$(echo $FAILED_MONTHS | wc -w)
-            echo "❌ Failed months ($FAILED_COUNT):$FAILED_MONTHS"
+            echo "Failed months ($FAILED_COUNT):$FAILED_MONTHS"
             echo ""
-            echo "🔗 Check logs for failed months:"
+            echo "Check logs for failed months:"
             echo "  - CloudWatch Logs: https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/%2Fecs%2F${{ env.PROJECT_NAME }}"
             exit 1
           else
-            echo "🎉 All months processed successfully!"
+            echo "All months processed successfully!"
           fi
         fi
-  
